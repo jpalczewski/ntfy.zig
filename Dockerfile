@@ -20,4 +20,8 @@ RUN /opt/zig/zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSmall
 FROM scratch
 COPY --from=builder /src/zig-out/bin/ntfy.zig /ntfy.zig
 EXPOSE 8085
+# scratch has no shell/curl/wget, so the healthcheck re-execs the same
+# binary in a self-check mode (see main.zig's healthcheck argv handling).
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["/ntfy.zig", "healthcheck"]
 ENTRYPOINT ["/ntfy.zig"]

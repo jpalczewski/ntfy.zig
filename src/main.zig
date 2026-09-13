@@ -28,6 +28,10 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
+    if (isHealthcheckInvocation(init.minimal.args)) {
+        return runHealthcheck(gpa, io);
+    }
+
     // Config strings (secrets, ntfy URLs/tokens) need to outlive this
     // function, so this arena is deliberately never deinitialized.
     var config_arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -71,6 +75,31 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+// `docker run --entrypoint /ntfy.zig ... healthcheck` re-execs the same
+// static binary in a self-check mode: the image is FROM scratch, so there's
+// no shell, curl, or wget for a normal Docker HEALTHCHECK to call.
+fn isHealthcheckInvocation(args: std.process.Args) bool {
+    var it: std.process.Args.Iterator = .init(args);
+    _ = it.next(); // argv[0]
+    const first = it.next() orelse return false;
+    return std.mem.eql(u8, first, "healthcheck");
+}
+
+fn runHealthcheck(gpa: std.mem.Allocator, io: Io) void {
+    ok: {
+        var client: http.Client = .{ .allocator = gpa, .io = io };
+        defer client.deinit();
+
+        const result = client.fetch(.{
+            .location = .{ .url = "http://127.0.0.1:" ++ std.fmt.comptimePrint("{d}", .{listen_port}) ++ "/health" },
+            .method = .GET,
+        }) catch break :ok;
+
+        if (result.status == .ok) std.process.exit(0);
+    }
+    std.process.exit(1);
+}
+
 fn handleConnection(
     gpa: std.mem.Allocator,
     io: Io,
@@ -112,6 +141,11 @@ fn handleConnection(
         };
     } else &.{};
     defer if (has_framed_body) gpa.free(body);
+
+    if (request.head.method == .GET and std.mem.eql(u8, request.head.target, "/health")) {
+        try request.respond("ok", .{ .status = .ok, .keep_alive = false });
+        return;
+    }
 
     const matched: ?Route = for (routes) |r| {
         if (r.channel.matches(request.head.method, request.head.target)) break r;
