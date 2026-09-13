@@ -18,6 +18,10 @@ COPY src ./src
 RUN /opt/zig/zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSmall
 
 FROM scratch
+# scratch has zero files by default — without this, the relay's outbound
+# HTTPS call to ntfy has no root CAs to verify the server cert against and
+# fails with TlsInitializationFailed. Confirmed live 2026-09-13.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /src/zig-out/bin/ntfy.zig /ntfy.zig
 EXPOSE 8085
 # scratch has no shell/curl/wget, so the healthcheck re-execs the same
