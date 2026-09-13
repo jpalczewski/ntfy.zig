@@ -21,4 +21,10 @@ jobs:
 
       - uses: muhammad-fiaz/zig-dependabot@3de70e81e0a44c5e4ae1fa1d2561fc13373967c7 # v1.0.1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # A PR opened with the default GITHUB_TOKEN can't trigger other
+          # workflows (e.g. ci.yml on pull_request), to prevent workflow
+          # recursion. ZIG_DEPS_PAT is a repo-scoped PAT (Contents +
+          # Pull requests: read/write) that doesn't have that restriction.
+          # Falls back to GITHUB_TOKEN if the secret isn't set, so this
+          # keeps working (just without auto-triggered CI) until it is.
+          token: ${{ secrets.ZIG_DEPS_PAT || secrets.GITHUB_TOKEN }}
