@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  ZIGLINT_VERSION: v0.5.3
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Check formatting
+        run: zig fmt --check build.zig build.zig.zon src
+
+      - name: Lint (zlinter)
+        run: zig build lint -- --max-warnings 0
+
+      - name: Install ziglint
+        run: |
+          curl --fail --location --silent --show-error \
+            "https://github.com/rockorager/ziglint/releases/download/${ZIGLINT_VERSION}/ziglint-x86_64-linux.tar.gz" \
+            --output "${RUNNER_TEMP}/ziglint.tar.gz"
+          tar -xzf "${RUNNER_TEMP}/ziglint.tar.gz" -C "${RUNNER_TEMP}"
+          sudo install -m 0755 "${RUNNER_TEMP}/ziglint" /usr/local/bin/ziglint
+
+      - name: Lint (ziglint)
+        run: ziglint src build.zig
+
+      - name: Run tests
+        run: zig build test
+
+      - name: Build
+        run: zig build
+
+  docker-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

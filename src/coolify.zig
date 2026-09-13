@@ -25,7 +25,7 @@ pub const Coolify = struct {
         return .{ .ptr = @constCast(self), .vtable = &vtable };
     }
 
-    const vtable = Channel.VTable{
+    const vtable: Channel.VTable = .{
         .matches = matches,
         .summarize = summarizeImpl,
     };
@@ -35,6 +35,7 @@ pub const Coolify = struct {
         return method == .POST and std.mem.eql(u8, target, self.target_path);
     }
 
+    // ziglint-ignore: Z023 (ptr must stay first to match Channel.VTable's fn-ptr signature)
     fn summarizeImpl(ptr: *anyopaque, arena: std.mem.Allocator, body: []const u8) anyerror!Summary {
         _ = ptr;
         return summarize(arena, body);
@@ -78,7 +79,7 @@ pub fn summarize(arena: std.mem.Allocator, body: []const u8) !Summary {
         try msg_buf.appendSlice(arena, e);
     }
 
-    return Summary{
+    return .{
         .title = title_buf.items,
         .message = msg_buf.items,
         .priority = if (success == false) "5" else "3",
@@ -87,8 +88,8 @@ pub fn summarize(arena: std.mem.Allocator, body: []const u8) !Summary {
 }
 
 fn getString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return switch (v) {
+    const field = obj.get(key) orelse return null;
+    return switch (field) {
         .string => |s| s,
         else => null,
     };
