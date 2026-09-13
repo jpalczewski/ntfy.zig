@@ -35,9 +35,15 @@ pub const Coolify = struct {
         return method == .POST and std.mem.eql(u8, target, self.target_path);
     }
 
-    // ziglint-ignore: Z023 (ptr must stay first to match Channel.VTable's fn-ptr signature)
-    fn summarizeImpl(ptr: *anyopaque, arena: std.mem.Allocator, body: []const u8) anyerror!Summary {
+    fn summarizeImpl(
+        ptr: *anyopaque,
+        // ziglint-ignore: Z023 (ptr must stay first to match Channel.VTable's fn-ptr signature)
+        arena: std.mem.Allocator,
+        body: []const u8,
+        raw_headers: []const u8,
+    ) anyerror!Summary {
         _ = ptr;
+        _ = raw_headers;
         return summarize(arena, body);
     }
 };

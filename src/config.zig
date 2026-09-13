@@ -7,10 +7,15 @@ const std = @import("std");
 const Io = std.Io;
 const Environ = std.process.Environ;
 
-pub const ChannelType = enum { coolify };
+pub const ChannelType = enum { coolify, github };
 
 pub const ChannelConfig = struct {
     type: ChannelType,
+    /// For `coolify`, the secret path segment (`/webhook/<secret>`) — the
+    /// only auth Coolify's webhook config can carry. For `github`, the
+    /// HMAC-SHA256 signing secret shared with GitHub's webhook config
+    /// (`X-Hub-Signature-256`); GitHub supports a real secret, so it's
+    /// verified rather than embedded in the URL.
     secret: []const u8,
     ntfy_url: []const u8,
     ntfy_token: []const u8,
@@ -110,6 +115,25 @@ test "loadFromEnv reads a single channel" {
     try std.testing.expectEqualStrings("s3cr3t", channels[0].secret);
     try std.testing.expectEqualStrings("https://ntfy.example.com", channels[0].ntfy_url);
     try std.testing.expectEqualStrings("tk_abc", channels[0].ntfy_token);
+}
+
+test "loadFromEnv reads a github channel" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var map = Environ.Map.init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("CHANNEL_1_TYPE", "github");
+    try map.put("CHANNEL_1_SECRET", "wh_s3cr3t");
+    try map.put("CHANNEL_1_NTFY_URL", "https://ntfy.example.com");
+    try map.put("CHANNEL_1_NTFY_TOKEN", "tk_abc");
+
+    const channels = try loadFromEnv(arena, &map);
+
+    try std.testing.expectEqual(1, channels.len);
+    try std.testing.expectEqual(ChannelType.github, channels[0].type);
+    try std.testing.expectEqualStrings("wh_s3cr3t", channels[0].secret);
 }
 
 test "loadFromEnv reads multiple channels until the sequence breaks" {
