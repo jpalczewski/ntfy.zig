@@ -28,13 +28,59 @@ nowhere to put a header), the relay reshapes the payload into a real
 title/message/priority, and forwards it to ntfy with a proper
 `Authorization` header.
 
-## Config (environment variables)
+## Config
 
-| Var | Meaning |
-|---|---|
-| `RELAY_SECRET` | Coolify's webhook URL must be `http://host:8085/webhook/<RELAY_SECRET>` — any other path (or method) gets a 404. |
-| `NTFY_URL` | Full ntfy publish URL, e.g. `https://ntfy.example.com/coolify`. |
-| `NTFY_TOKEN` | ntfy access token (`ntfy token add <user>`) for a user scoped to `write-only` on that one topic — don't hand this relay an admin token. |
+The relay serves one or more **channels**. Each channel picks its own secret
+path (`/webhook/<secret>`) and its own ntfy target, so e.g. Coolify can post
+to one topic/token and another source can post to a different one. Configure
+channels with *either* numbered environment variables or a JSON file —
+whichever fits how you deploy (Coolify's own UI only offers env vars; a file
+scales better once you have several channels).
+
+### Option A: numbered environment variables
+
+```
+CHANNEL_1_TYPE=coolify
+CHANNEL_1_SECRET=<secret>
+CHANNEL_1_NTFY_URL=https://ntfy.example.com/coolify
+CHANNEL_1_NTFY_TOKEN=<ntfy token>
+
+CHANNEL_2_TYPE=coolify
+CHANNEL_2_SECRET=<other secret>
+CHANNEL_2_NTFY_URL=https://ntfy.example.com/other
+CHANNEL_2_NTFY_TOKEN=<other ntfy token>
+```
+
+The relay reads `CHANNEL_1_*`, then `CHANNEL_2_*`, and so on until
+`CHANNEL_<n>_TYPE` is unset. Coolify's webhook URL for a channel must be
+`http://host:8085/webhook/<CHANNEL_n_SECRET>` — any other path (or method)
+gets a 404.
+
+### Option B: a JSON config file
+
+Set `CONFIG_FILE=/path/to/config.json` to a file shaped like:
+
+```json
+{
+  "channels": [
+    {
+      "type": "coolify",
+      "secret": "<secret>",
+      "ntfy_url": "https://ntfy.example.com/coolify",
+      "ntfy_token": "<ntfy token>"
+    }
+  ]
+}
+```
+
+`CONFIG_FILE` takes precedence over the numbered env vars if both are set.
+`type` is currently always `"coolify"`; a new input source (GitHub, Grafana,
+a generic webhook, ...) means adding a `Channel` implementation (see
+`src/channel.zig`) and a new enum value in `src/config.zig`, not a config
+format change.
+
+Each `ntfy_token` should be scoped to `write-only` on that one topic
+(`ntfy token add <user>`) — don't hand this relay an admin token.
 
 Listens on `:8085`.
 

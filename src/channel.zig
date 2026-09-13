@@ -30,3 +30,12 @@ pub const Channel = struct {
         return self.vtable.summarize(self.ptr, arena, body);
     }
 };
+
+/// A channel paired with the ntfy target its notifications get forwarded to.
+/// Each source can point at a different topic/token — the parsing strategy
+/// (`Channel`) doesn't need to know or care where its output ends up.
+pub const Route = struct {
+    channel: Channel,
+    ntfy_url: []const u8,
+    ntfy_token: []const u8,
+};
