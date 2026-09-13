@@ -64,7 +64,12 @@ fn loadFromEnv(arena: std.mem.Allocator, environ_map: *const Environ.Map) ![]con
     return channels.items;
 }
 
-fn requireIndexedEnv(arena: std.mem.Allocator, environ_map: *const Environ.Map, name: []const u8, index: usize) ![]const u8 {
+fn requireIndexedEnv(
+    arena: std.mem.Allocator,
+    environ_map: *const Environ.Map,
+    name: []const u8,
+    index: usize,
+) ![]const u8 {
     const key = try std.fmt.allocPrint(arena, "CHANNEL_{d}_{s}", .{ index, name });
     return environ_map.get(key) orelse {
         std.log.warn("{s} not set", .{key});
@@ -76,7 +81,10 @@ fn checkDuplicateSecrets(channels: []const ChannelConfig) !void {
     for (channels, 0..) |a, i| {
         for (channels[i + 1 ..]) |b| {
             if (std.mem.eql(u8, a.secret, b.secret)) {
-                std.log.warn("duplicate channel secret: two channels share the same secret, the second is unreachable", .{});
+                std.log.warn(
+                    "duplicate channel secret: two channels share the same secret, the second is unreachable",
+                    .{},
+                );
                 return error.DuplicateSecret;
             }
         }
