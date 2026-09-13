@@ -15,6 +15,7 @@ const channel = @import("channel.zig");
 const Route = channel.Route;
 const Summary = channel.Summary;
 const coolify = @import("coolify.zig");
+const github = @import("github.zig");
 const config = @import("config.zig");
 
 const listen_port: u16 = 8085;
@@ -48,6 +49,15 @@ pub fn main(init: std.process.Init) !void {
             .coolify => blk: {
                 const c = try gpa.create(coolify.Coolify);
                 c.* = try coolify.Coolify.init(gpa, cc.secret);
+                break :blk c.channel();
+            },
+            .github => blk: {
+                const c = try gpa.create(github.Github);
+                c.* = try github.Github.init(gpa, cc.secret);
+                // The path is derived from the secret (not the secret itself, see
+                // github.zig), so it isn't knowable ahead of time — log it so it can
+                // be pasted into GitHub's webhook "Payload URL" field.
+                std.log.info("github channel: payload URL path is {s}", .{c.target_path});
                 break :blk c.channel();
             },
         };
@@ -120,6 +130,33 @@ fn handleConnection(
         else => return err,
     };
 
+    if (request.head.method == .GET and std.mem.eql(u8, request.head.target, "/health")) {
+        try request.respond("ok", .{ .status = .ok, .keep_alive = false });
+        return;
+    }
+
+    const matched: ?Route = for (routes) |r| {
+        if (r.channel.matches(request.head.method, request.head.target)) break r;
+    } else null;
+
+    const route = matched orelse {
+        try request.respond("not found", .{ .status = .not_found, .keep_alive = false });
+        return;
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `request.head`/`request.head_buffer` (and therefore `target`/`method`
+    // used above) are only valid up to this point: initializing the body
+    // reader below invalidates every pointer into them (confirmed live — a
+    // debug build segfaults on a poisoned `undefined` read if you touch
+    // `head_buffer` afterward). So the raw header bytes a channel might need
+    // (GitHub's signature/event headers) must be copied out now, before the
+    // body is read, not passed as a view into the connection buffer.
+    const raw_headers = try arena.dupe(u8, request.head_buffer);
+
     // A POST with neither content-length nor chunked transfer-encoding is
     // unframed — std.http's bodyReader falls back to handing us the raw
     // connection reader in that case (reads until the peer closes), which
@@ -142,32 +179,25 @@ fn handleConnection(
     } else &.{};
     defer if (has_framed_body) gpa.free(body);
 
-    if (request.head.method == .GET and std.mem.eql(u8, request.head.target, "/health")) {
-        try request.respond("ok", .{ .status = .ok, .keep_alive = false });
-        return;
-    }
-
-    const matched: ?Route = for (routes) |r| {
-        if (r.channel.matches(request.head.method, request.head.target)) break r;
-    } else null;
-
-    const route = matched orelse {
-        try request.respond("not found", .{ .status = .not_found, .keep_alive = false });
-        return;
-    };
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const summary = route.channel.summarize(arena, body) catch |err| blk: {
-        std.log.warn("failed to parse webhook payload: {t}", .{err});
-        break :blk Summary{
-            .title = "ntfy.zig",
-            .message = body,
-            .priority = "3",
-            .tags = "warning",
-        };
+    const summary = route.channel.summarize(arena, body, raw_headers) catch |err| switch (err) {
+        error.InvalidSignature => {
+            std.log.warn("rejected webhook: invalid signature", .{});
+            try request.respond("unauthorized", .{ .status = .unauthorized, .keep_alive = false });
+            return;
+        },
+        error.Ignored => {
+            try request.respond("ok", .{ .status = .ok, .keep_alive = false });
+            return;
+        },
+        else => blk: {
+            std.log.warn("failed to parse webhook payload: {t}", .{err});
+            break :blk Summary{
+                .title = "ntfy.zig",
+                .message = body,
+                .priority = "3",
+                .tags = "warning",
+            };
+        },
     };
 
     forwardToNtfy(gpa, io, route.ntfy_url, route.ntfy_token, summary) catch |err| {
@@ -207,6 +237,7 @@ fn forwardToNtfy(gpa: std.mem.Allocator, io: Io, ntfy_url: []const u8, ntfy_toke
 test {
     std.testing.refAllDecls(channel);
     std.testing.refAllDecls(coolify);
+    std.testing.refAllDecls(github);
     std.testing.refAllDecls(config);
     std.testing.refAllDecls(json_log);
 }

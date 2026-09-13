@@ -1,8 +1,8 @@
 # ntfy.zig
 
-A tiny relay that turns [Coolify](https://coolify.io)'s generic "Webhook"
-notification channel into a proper [ntfy](https://ntfy.sh) push
-notification. Single static binary (Zig, `-target x86_64-linux-musl`), no
+A tiny relay that turns webhooks from [Coolify](https://coolify.io) and
+GitHub (Actions runs, Deployments) into proper [ntfy](https://ntfy.sh) push
+notifications. Single static binary (Zig, `-target x86_64-linux-musl`), no
 runtime, no dependencies — built for a `FROM scratch` container.
 
 ## Why this exists
@@ -30,12 +30,26 @@ title/message/priority, and forwards it to ntfy with a proper
 
 ## Config
 
-The relay serves one or more **channels**. Each channel picks its own secret
-path (`/webhook/<secret>`) and its own ntfy target, so e.g. Coolify can post
-to one topic/token and another source can post to a different one. Configure
-channels with *either* numbered environment variables or a JSON file —
-whichever fits how you deploy (Coolify's own UI only offers env vars; a file
-scales better once you have several channels).
+The relay serves one or more **channels**. Each channel picks its own ntfy
+target, so e.g. Coolify can post to one topic/token and another source can
+post to a different one. Configure channels with *either* numbered
+environment variables or a JSON file — whichever fits how you deploy
+(Coolify's own UI only offers env vars; a file scales better once you have
+several channels).
+
+Two channel types are supported today:
+
+- **`coolify`** — authenticated by a secret path segment
+  (`/webhook/<secret>`), since Coolify's webhook config has nowhere to put a
+  header or token. The path *is* the auth.
+- **`github`** — GitHub Actions (`workflow_run`) and Deployments
+  (`deployment_status`) events. Unlike Coolify, GitHub webhooks support a
+  real shared secret: each delivery is signed with HMAC-SHA256 in the
+  `X-Hub-Signature-256` header, and this relay verifies it. A request with a
+  missing or invalid signature is rejected with `401` and never forwarded.
+  Everything else (other event types, or a `workflow_run`/`deployment_status`
+  that isn't yet in a terminal state) is acknowledged with `200` and silently
+  dropped, so a webhook subscribed to "everything" won't spam ntfy.
 
 ### Option A: numbered environment variables
 
@@ -45,16 +59,26 @@ CHANNEL_1_SECRET=<secret>
 CHANNEL_1_NTFY_URL=https://ntfy.example.com/coolify
 CHANNEL_1_NTFY_TOKEN=<ntfy token>
 
-CHANNEL_2_TYPE=coolify
-CHANNEL_2_SECRET=<other secret>
-CHANNEL_2_NTFY_URL=https://ntfy.example.com/other
+CHANNEL_2_TYPE=github
+CHANNEL_2_SECRET=<webhook secret>
+CHANNEL_2_NTFY_URL=https://ntfy.example.com/github
 CHANNEL_2_NTFY_TOKEN=<other ntfy token>
 ```
 
 The relay reads `CHANNEL_1_*`, then `CHANNEL_2_*`, and so on until
-`CHANNEL_<n>_TYPE` is unset. Coolify's webhook URL for a channel must be
-`http://host:8085/webhook/<CHANNEL_n_SECRET>` — any other path (or method)
-gets a 404.
+`CHANNEL_<n>_TYPE` is unset.
+
+- For `coolify`, `SECRET` is the URL path segment: point Coolify's webhook at
+  `http://host:8085/webhook/<CHANNEL_n_SECRET>` — any other path (or method)
+  gets a 404.
+- For `github`, `SECRET` is the HMAC signing secret — paste the *same* value
+  into this webhook's "Secret" field in GitHub's repo settings (Settings →
+  Webhooks → Add webhook). The payload URL isn't the secret itself; it's
+  logged at startup (`github channel: payload URL path is
+  /webhook/github/<hex>`), so start the relay first and read the URL to use
+  from its logs. Content type: `application/json`. Under "Which events
+  would you like to trigger this webhook?", select individual events:
+  **Workflow runs** and **Deployment statuses**.
 
 ### Option B: a JSON config file
 
@@ -68,16 +92,21 @@ Set `CONFIG_FILE=/path/to/config.json` to a file shaped like:
       "secret": "<secret>",
       "ntfy_url": "https://ntfy.example.com/coolify",
       "ntfy_token": "<ntfy token>"
+    },
+    {
+      "type": "github",
+      "secret": "<webhook secret>",
+      "ntfy_url": "https://ntfy.example.com/github",
+      "ntfy_token": "<other ntfy token>"
     }
   ]
 }
 ```
 
 `CONFIG_FILE` takes precedence over the numbered env vars if both are set.
-`type` is currently always `"coolify"`; a new input source (GitHub, Grafana,
-a generic webhook, ...) means adding a `Channel` implementation (see
-`src/channel.zig`) and a new enum value in `src/config.zig`, not a config
-format change.
+A further input source (Grafana, a generic webhook, ...) means adding a
+`Channel` implementation (see `src/channel.zig`) and a new enum value in
+`src/config.zig`, not a config format change.
 
 Each `ntfy_token` should be scoped to `write-only` on that one topic
 (`ntfy token add <user>`) — don't hand this relay an admin token.
@@ -113,3 +142,15 @@ connection alive for reuse. Two things fix it, both present in
 
 This relay only ever serves single, low-volume requests, so giving up
 keep-alive costs nothing.
+
+A related trap: `std.http.Server.Request`'s own doc comment warns that
+"pointers in this struct are invalidated when the request body stream is
+initialized" — and it means it. Confirmed live: reading a request's body via
+`readerExpectContinue`/`allocRemaining` and *then* reading `request.head.target`
+or `request.head_buffer` hands back poisoned `undefined` memory in a debug
+build (a hard segfault) rather than the bytes you expect. `request.head.target`
+and `.method` are plain values/slices captured at `receiveHead()` time and stay
+valid right up until the body reader is touched — so this relay finishes
+everything that needs them (the `/health` check, route matching, and copying
+out `request.head_buffer` for a channel that reads request headers) *before*
+reading the body, not after.

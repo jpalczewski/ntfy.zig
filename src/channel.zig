@@ -19,17 +19,36 @@ pub const Channel = struct {
 
     pub const VTable = struct {
         matches: *const fn (ptr: *anyopaque, method: std.http.Method, target: []const u8) bool,
-        summarize: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, body: []const u8) anyerror!Summary,
+        summarize: *const fn (
+            ptr: *anyopaque,
+            arena: std.mem.Allocator,
+            body: []const u8,
+            raw_headers: []const u8,
+        ) anyerror!Summary,
     };
 
     pub fn matches(self: Channel, method: std.http.Method, target: []const u8) bool {
         return self.vtable.matches(self.ptr, method, target);
     }
 
-    pub fn summarize(self: Channel, arena: std.mem.Allocator, body: []const u8) !Summary {
-        return self.vtable.summarize(self.ptr, arena, body);
+    /// `raw_headers` is the request's raw header bytes (`request.head_buffer`)
+    /// for channels that need to read a header (e.g. GitHub's signature and
+    /// event-type headers) — sources that don't need headers just ignore it.
+    pub fn summarize(self: Channel, arena: std.mem.Allocator, body: []const u8, raw_headers: []const u8) !Summary {
+        return self.vtable.summarize(self.ptr, arena, body, raw_headers);
     }
 };
+
+/// Case-insensitive lookup of a single header's value in a request's raw
+/// header bytes. Returns the first match; GitHub-style single-valued headers
+/// (signature, event type) never repeat, so first-match is exact enough.
+pub fn findHeader(raw_headers: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.http.HeaderIterator.init(raw_headers);
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+    }
+    return null;
+}
 
 /// A channel paired with the ntfy target its notifications get forwarded to.
 /// Each source can point at a different topic/token — the parsing strategy
