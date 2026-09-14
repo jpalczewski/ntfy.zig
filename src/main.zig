@@ -20,6 +20,7 @@ const config = @import("config.zig");
 
 const listen_port: u16 = 8085;
 const max_body_bytes: usize = 64 * 1024;
+const ntfy_timeout: Io.Duration = .{ .nanoseconds = 10 * std.time.ns_per_s };
 
 pub const std_options: std.Options = .{
     .logFn = json_log.jsonLog,
@@ -74,15 +75,30 @@ pub fn main(init: std.process.Init) !void {
 
     std.log.info("ntfy.zig listening on :{d} with {d} channel(s)", .{ listen_port, routes.items.len });
 
+    // Each connection is handled in its own task so a slow channel/ntfy
+    // response can't stall unrelated webhooks. `Group.concurrent` (rather
+    // than `.async`) is what actually guarantees a separate thread — `.async`
+    // is allowed to run inline once the implementation's (CPU-count-based)
+    // async_limit is reached, which on a single-core container is 0. `gpa`
+    // and `io` are documented threadsafe (see std.process.Init); routes are
+    // built once above and never mutated afterward, so sharing them across
+    // tasks is safe.
+    var tasks: Io.Group = .init;
     while (true) {
         const stream = server.accept(io) catch |err| {
             std.log.err("accept failed: {t}", .{err});
             continue;
         };
-        handleConnection(gpa, io, stream, routes.items) catch |err| {
-            std.log.err("connection error: {t}", .{err});
+        tasks.concurrent(io, handleConnectionTask, .{ gpa, io, stream, routes.items }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => handleConnectionTask(gpa, io, stream, routes.items),
         };
     }
+}
+
+fn handleConnectionTask(gpa: std.mem.Allocator, io: Io, stream: net.Stream, routes: []const Route) void {
+    handleConnection(gpa, io, stream, routes) catch |err| {
+        std.log.err("connection error: {t}", .{err});
+    };
 }
 
 // `docker run --entrypoint /ntfy.zig ... healthcheck` re-execs the same
@@ -207,14 +223,55 @@ fn handleConnection(
     try request.respond("ok", .{ .status = .ok, .keep_alive = false });
 }
 
-fn forwardToNtfy(gpa: std.mem.Allocator, io: Io, ntfy_url: []const u8, ntfy_token: []const u8, summary: Summary) !void {
-    var client: http.Client = .{ .allocator = gpa, .io = io };
-    defer client.deinit();
+const NtfyOutcome = union(enum) {
+    fetch: http.Client.FetchError!http.Client.FetchResult,
+    timed_out: void,
+};
 
+fn forwardToNtfy(gpa: std.mem.Allocator, io: Io, ntfy_url: []const u8, ntfy_token: []const u8, summary: Summary) !void {
     const auth_value = try std.fmt.allocPrint(gpa, "Bearer {s}", .{ntfy_token});
     defer gpa.free(auth_value);
 
-    const result = try client.fetch(.{
+    // Race the ntfy request against a timer so a hung/slow ntfy endpoint
+    // can't pin this connection's thread forever. Both legs must use
+    // `.concurrent`, not `.async`: `.async` is allowed to run its function
+    // inline (blocking, to completion) instead of on a separate task once
+    // the Io implementation's thread limit is reached — on a single-core
+    // container that limit is 0, which would turn the "race" into just
+    // running one leg fully before the other ever starts.
+    var outcome_buf: [2]NtfyOutcome = undefined;
+    var select: Io.Select(NtfyOutcome) = .init(io, &outcome_buf);
+    // Guarantees the still-running leg (if any) is interrupted and reaped
+    // before this stack frame — and the `select`/`outcome_buf` it points
+    // into — goes away, on every return path including `error.Canceled`
+    // from `await` below. Safe to call more than once (e.g. after the
+    // explicit calls below already ran it).
+    defer select.cancelDiscard();
+
+    select.concurrent(.fetch, fetchNtfy, .{ gpa, io, ntfy_url, auth_value, summary }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return reportFetchResult(fetchNtfy(gpa, io, ntfy_url, auth_value, summary)),
+    };
+    select.concurrent(.timed_out, sleepFor, .{ io, ntfy_timeout }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return reportFetchResult((try select.await()).fetch),
+    };
+
+    switch (try select.await()) {
+        .fetch => |result| try reportFetchResult(result),
+        .timed_out => std.log.err("ntfy request timed out after {d}s", .{@divTrunc(ntfy_timeout.nanoseconds, std.time.ns_per_s)}),
+    }
+}
+
+fn fetchNtfy(
+    gpa: std.mem.Allocator,
+    io: Io,
+    ntfy_url: []const u8,
+    auth_value: []const u8,
+    summary: Summary,
+) http.Client.FetchError!http.Client.FetchResult {
+    var client: http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+
+    return client.fetch(.{
         .location = .{ .url = ntfy_url },
         .method = .POST,
         .payload = summary.message,
@@ -225,9 +282,21 @@ fn forwardToNtfy(gpa: std.mem.Allocator, io: Io, ntfy_url: []const u8, ntfy_toke
             .{ .name = "X-Tags", .value = summary.tags },
         },
     });
+}
 
-    if (result.status != .ok) {
-        std.log.err("ntfy responded with status {d}", .{@intFromEnum(result.status)});
+fn sleepFor(io: Io, duration: Io.Duration) void {
+    // The only error is `error.Canceled`, which happens whenever the fetch
+    // leg of the race wins (this task then gets reaped by `cancelDiscard`);
+    // there is nothing to report.
+    // ziglint-ignore: Z026
+    // zlinter-disable-next-line no_swallow_error
+    io.sleep(duration, .awake) catch {};
+}
+
+fn reportFetchResult(result: http.Client.FetchError!http.Client.FetchResult) !void {
+    const fetch_result = try result;
+    if (fetch_result.status != .ok) {
+        std.log.err("ntfy responded with status {d}", .{@intFromEnum(fetch_result.status)});
     }
 }
 
