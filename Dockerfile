@@ -24,8 +24,15 @@ FROM scratch
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /src/zig-out/bin/ntfy.zig /ntfy.zig
 EXPOSE 8085
+# Deliberately no `EXPOSE 9090`: that's the health/metrics port (see
+# main.zig's internal_port), kept off the published webhook port so
+# exposing 8085 to the internet doesn't also expose request counters and
+# forward-latency data. Reach it via the container network (e.g. a
+# Prometheus scrape target of `<container>:9090`), not a published port.
 # scratch has no shell/curl/wget, so the healthcheck re-execs the same
-# binary in a self-check mode (see main.zig's healthcheck argv handling).
+# binary in a self-check mode (see main.zig's healthcheck argv handling);
+# it calls 127.0.0.1:9090/health directly, inside the container, so it
+# doesn't need the port published either.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD ["/ntfy.zig", "healthcheck"]
 ENTRYPOINT ["/ntfy.zig"]

@@ -17,8 +17,15 @@ const Summary = channel.Summary;
 const coolify = @import("coolify.zig");
 const github = @import("github.zig");
 const config = @import("config.zig");
+const metrics = @import("metrics.zig");
 
 const listen_port: u16 = 8085;
+/// Serves only `/health` and `/metrics` — kept off `listen_port` so exposing
+/// the webhook port to the internet doesn't also expose request counters and
+/// forward-latency data. Not published in the Dockerfile; reach it via the
+/// container network (e.g. a Prometheus scrape target of
+/// `<container>:9090`) or `docker exec`/a debug port-forward.
+const internal_port: u16 = 9090;
 const max_body_bytes: usize = 64 * 1024;
 const ntfy_timeout: Io.Duration = .{ .nanoseconds = 10 * std.time.ns_per_s };
 
@@ -66,14 +73,24 @@ pub fn main(init: std.process.Init) !void {
             .channel = route_channel,
             .ntfy_url = cc.ntfy_url,
             .ntfy_token = cc.ntfy_token,
+            .kind = cc.type,
         });
     }
+
+    var app_metrics: metrics.Metrics = .{};
 
     var address = try net.IpAddress.parseIp4("0.0.0.0", listen_port);
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
-    std.log.info("ntfy.zig listening on :{d} with {d} channel(s)", .{ listen_port, routes.items.len });
+    var internal_address = try net.IpAddress.parseIp4("0.0.0.0", internal_port);
+    var internal_server = try internal_address.listen(io, .{ .reuse_address = true });
+    defer internal_server.deinit(io);
+
+    std.log.info(
+        "ntfy.zig listening on :{d} (webhooks) and :{d} (health/metrics) with {d} channel(s)",
+        .{ listen_port, internal_port, routes.items.len },
+    );
 
     // Each connection is handled in its own task so a slow channel/ntfy
     // response can't stall unrelated webhooks. `Group.concurrent` (rather
@@ -84,21 +101,122 @@ pub fn main(init: std.process.Init) !void {
     // built once above and never mutated afterward, so sharing them across
     // tasks is safe.
     var tasks: Io.Group = .init;
+
+    // The health/metrics loop below never returns, so it must actually run
+    // on a separate worker — if no concurrency capacity is available to spawn
+    // it, running it inline here would block this thread forever and take
+    // the webhook loop down with it. Log and keep the webhook loop running
+    // instead of crashing the whole process over it; Docker's HEALTHCHECK
+    // (which depends on this same port, see runHealthcheck) will start
+    // failing and eventually restart the container regardless.
+    tasks.concurrent(io, runInternalServer, .{ io, &internal_server, &app_metrics }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => std.log.err(
+            "health/metrics server unavailable: no concurrency capacity to run it",
+            .{},
+        ),
+    };
+
     while (true) {
         const stream = server.accept(io) catch |err| {
             std.log.err("accept failed: {t}", .{err});
             continue;
         };
-        tasks.concurrent(io, handleConnectionTask, .{ gpa, io, stream, routes.items }) catch |err| switch (err) {
-            error.ConcurrencyUnavailable => handleConnectionTask(gpa, io, stream, routes.items),
+        const args = .{ gpa, io, stream, routes.items, &app_metrics };
+        tasks.concurrent(io, handleConnectionTask, args) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => @call(.auto, handleConnectionTask, args),
         };
     }
 }
 
-fn handleConnectionTask(gpa: std.mem.Allocator, io: Io, stream: net.Stream, routes: []const Route) void {
-    handleConnection(gpa, io, stream, routes) catch |err| {
+fn handleConnectionTask(
+    gpa: std.mem.Allocator,
+    io: Io,
+    stream: net.Stream,
+    routes: []const Route,
+    app_metrics: *metrics.Metrics,
+) void {
+    handleConnection(gpa, io, stream, routes, app_metrics) catch |err| {
         std.log.err("connection error: {t}", .{err});
     };
+}
+
+// Runs for the lifetime of the process. Connections here (health checks,
+// Prometheus scrapes) do no outbound I/O and finish in microseconds, so
+// unlike the webhook loop above they're handled inline rather than each
+// getting their own task — there's nothing here that could stall.
+fn runInternalServer(io: Io, server: *net.Server, app_metrics: *metrics.Metrics) void {
+    while (true) {
+        const stream = server.accept(io) catch |err| {
+            std.log.err("internal accept failed: {t}", .{err});
+            continue;
+        };
+        handleMetricsConnection(io, stream, app_metrics) catch |err| {
+            std.log.err("internal connection error: {t}", .{err});
+        };
+    }
+}
+
+// Owns the per-connection I/O buffers and HTTP framing state that both
+// `handleConnection` and `handleMetricsConnection` need. Kept as a struct
+// (rather than a helper function returning a `Request`) because
+// `http.Server`/`Request` hold pointers into the reader/writer/buffers —
+// those have to live in the *caller's* stack frame for the lifetime of the
+// request, not get built and dropped inside a helper function.
+const HttpConn = struct {
+    // Every field below is assigned in `receiveHead` before anything reads
+    // it — `undefined` here only reserves the storage these self-referential
+    // pointers (reader → buffer, server → reader/writer) need to live at a
+    // stable address. See the struct doc comment above.
+    // zlinter-disable-next-line no_undefined
+    send_buffer: [4096]u8 = undefined,
+    // zlinter-disable-next-line no_undefined
+    recv_buffer: [8192]u8 = undefined,
+    // zlinter-disable-next-line no_undefined
+    reader: net.Stream.Reader = undefined,
+    // zlinter-disable-next-line no_undefined
+    writer: net.Stream.Writer = undefined,
+    // zlinter-disable-next-line no_undefined
+    server: http.Server = undefined,
+
+    /// Returns `null` if the client closed the connection before sending a
+    /// request — routine with keep-alive probes, not an error.
+    fn receiveHead(self: *HttpConn, io: Io, stream: net.Stream) !?http.Server.Request {
+        self.reader = stream.reader(io, &self.recv_buffer);
+        self.writer = stream.writer(io, &self.send_buffer);
+        self.server = .init(&self.reader.interface, &self.writer.interface);
+        const request = self.server.receiveHead() catch |err| switch (err) {
+            error.HttpConnectionClosing => return null,
+            else => return err,
+        };
+        return request;
+    }
+};
+
+fn handleMetricsConnection(io: Io, stream_in: net.Stream, app_metrics: *metrics.Metrics) !void {
+    var stream = stream_in;
+    defer stream.close(io);
+
+    var conn: HttpConn = .{};
+    var request = (try conn.receiveHead(io, stream)) orelse return;
+
+    if (request.head.method == .GET and std.mem.eql(u8, request.head.target, "/health")) {
+        try request.respond("ok", .{ .status = .ok, .keep_alive = false });
+        return;
+    }
+
+    if (request.head.method == .GET and std.mem.eql(u8, request.head.target, "/metrics")) {
+        var metrics_buf: [4096]u8 = undefined;
+        var metrics_writer = std.Io.Writer.fixed(&metrics_buf);
+        try app_metrics.write(&metrics_writer);
+        try request.respond(metrics_writer.buffered(), .{
+            .status = .ok,
+            .keep_alive = false,
+            .extra_headers = &.{.{ .name = "content-type", .value = "text/plain; version=0.0.4" }},
+        });
+        return;
+    }
+
+    try request.respond("not found", .{ .status = .not_found, .keep_alive = false });
 }
 
 // `docker run --entrypoint /ntfy.zig ... healthcheck` re-execs the same
@@ -117,7 +235,7 @@ fn runHealthcheck(gpa: std.mem.Allocator, io: Io) void {
         defer client.deinit();
 
         const result = client.fetch(.{
-            .location = .{ .url = "http://127.0.0.1:" ++ std.fmt.comptimePrint("{d}", .{listen_port}) ++ "/health" },
+            .location = .{ .url = "http://127.0.0.1:" ++ std.fmt.comptimePrint("{d}", .{internal_port}) ++ "/health" },
             .method = .GET,
         }) catch break :ok;
 
@@ -131,31 +249,20 @@ fn handleConnection(
     io: Io,
     stream_in: net.Stream,
     routes: []const Route,
+    app_metrics: *metrics.Metrics,
 ) !void {
     var stream = stream_in;
     defer stream.close(io);
 
-    var send_buffer: [4096]u8 = undefined;
-    var recv_buffer: [8192]u8 = undefined;
-    var connection_reader = stream.reader(io, &recv_buffer);
-    var connection_writer = stream.writer(io, &send_buffer);
-    var server: http.Server = .init(&connection_reader.interface, &connection_writer.interface);
-
-    var request = server.receiveHead() catch |err| switch (err) {
-        error.HttpConnectionClosing => return,
-        else => return err,
-    };
-
-    if (request.head.method == .GET and std.mem.eql(u8, request.head.target, "/health")) {
-        try request.respond("ok", .{ .status = .ok, .keep_alive = false });
-        return;
-    }
+    var conn: HttpConn = .{};
+    var request = (try conn.receiveHead(io, stream)) orelse return;
 
     const matched: ?Route = for (routes) |r| {
         if (r.channel.matches(request.head.method, request.head.target)) break r;
     } else null;
 
     const route = matched orelse {
+        app_metrics.recordUnmatched();
         try request.respond("not found", .{ .status = .not_found, .keep_alive = false });
         return;
     };
@@ -185,28 +292,34 @@ fn handleConnection(
 
     const body = if (has_framed_body) blk: {
         const body_reader = request.readerExpectContinue(&.{}) catch |err| {
+            app_metrics.recordRequest(route.kind, .bad_request);
             try request.respond("bad request", .{ .status = .bad_request, .keep_alive = false });
             return err;
         };
         break :blk body_reader.allocRemaining(gpa, Io.Limit.limited(max_body_bytes)) catch {
+            app_metrics.recordRequest(route.kind, .payload_too_large);
             try request.respond("payload too large", .{ .status = .payload_too_large, .keep_alive = false });
             return;
         };
     } else &.{};
     defer if (has_framed_body) gpa.free(body);
 
+    var outcome: metrics.Outcome = .forwarded;
     const summary = route.channel.summarize(arena, body, raw_headers) catch |err| switch (err) {
         error.InvalidSignature => {
             std.log.warn("rejected webhook: invalid signature", .{});
+            app_metrics.recordRequest(route.kind, .invalid_signature);
             try request.respond("unauthorized", .{ .status = .unauthorized, .keep_alive = false });
             return;
         },
         error.Ignored => {
+            app_metrics.recordRequest(route.kind, .ignored);
             try request.respond("ok", .{ .status = .ok, .keep_alive = false });
             return;
         },
         else => blk: {
             std.log.warn("failed to parse webhook payload: {t}", .{err});
+            outcome = .parse_fallback;
             break :blk Summary{
                 .title = "ntfy.zig",
                 .message = body,
@@ -215,10 +328,19 @@ fn handleConnection(
             };
         },
     };
+    app_metrics.recordRequest(route.kind, outcome);
 
+    const forward_start = Io.Clock.awake.now(io);
     forwardToNtfy(gpa, io, route.ntfy_url, route.ntfy_token, summary) catch |err| {
-        std.log.err("failed to forward to ntfy: {t}", .{err});
+        switch (err) {
+            // Already logged with the specific status/timeout detail below.
+            error.NtfyTimeout, error.NtfyRejected => {},
+            else => std.log.err("failed to forward to ntfy: {t}", .{err}),
+        }
+        app_metrics.recordForwardFailure(route.kind);
     };
+    const elapsed_ns = forward_start.durationTo(Io.Clock.awake.now(io)).nanoseconds;
+    app_metrics.recordForwardDuration(route.kind, @intCast(@max(elapsed_ns, 0)));
 
     try request.respond("ok", .{ .status = .ok, .keep_alive = false });
 }
@@ -228,7 +350,13 @@ const NtfyOutcome = union(enum) {
     timed_out: void,
 };
 
-fn forwardToNtfy(gpa: std.mem.Allocator, io: Io, ntfy_url: []const u8, ntfy_token: []const u8, summary: Summary) !void {
+fn forwardToNtfy(
+    gpa: std.mem.Allocator,
+    io: Io,
+    ntfy_url: []const u8,
+    ntfy_token: []const u8,
+    summary: Summary,
+) !void {
     const auth_value = try std.fmt.allocPrint(gpa, "Bearer {s}", .{ntfy_token});
     defer gpa.free(auth_value);
 
@@ -249,7 +377,10 @@ fn forwardToNtfy(gpa: std.mem.Allocator, io: Io, ntfy_url: []const u8, ntfy_toke
     defer select.cancelDiscard();
 
     select.concurrent(.fetch, fetchNtfy, .{ gpa, io, ntfy_url, auth_value, summary }) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => return reportFetchResult(fetchNtfy(gpa, io, ntfy_url, auth_value, summary)),
+        error.ConcurrencyUnavailable => {
+            const result = fetchNtfy(gpa, io, ntfy_url, auth_value, summary);
+            return reportFetchResult(result);
+        },
     };
     select.concurrent(.timed_out, sleepFor, .{ io, ntfy_timeout }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => return reportFetchResult((try select.await()).fetch),
@@ -257,10 +388,13 @@ fn forwardToNtfy(gpa: std.mem.Allocator, io: Io, ntfy_url: []const u8, ntfy_toke
 
     switch (try select.await()) {
         .fetch => |result| try reportFetchResult(result),
-        .timed_out => std.log.err(
-            "ntfy request timed out after {d}s",
-            .{@divTrunc(ntfy_timeout.nanoseconds, std.time.ns_per_s)},
-        ),
+        .timed_out => {
+            std.log.err(
+                "ntfy request timed out after {d}s",
+                .{@divTrunc(ntfy_timeout.nanoseconds, std.time.ns_per_s)},
+            );
+            return error.NtfyTimeout;
+        },
     }
 }
 
@@ -300,7 +434,27 @@ fn reportFetchResult(result: http.Client.FetchError!http.Client.FetchResult) !vo
     const fetch_result = try result;
     if (fetch_result.status != .ok) {
         std.log.err("ntfy responded with status {d}", .{@intFromEnum(fetch_result.status)});
+        return error.NtfyRejected;
     }
+}
+
+test "reportFetchResult succeeds for a 200 response" {
+    try reportFetchResult(.{ .status = .ok });
+}
+
+// Not tested here: a non-2xx status returning error.NtfyRejected. Verified
+// manually instead (see PR description) — it calls std.log.err, and Zig's
+// test runner fails the whole `zig build test` step ("N errors were
+// logged") whenever *any* test causes an .err-level log, independent of
+// that test's own pass/fail. Downgrading the log level just to make this
+// path testable would lose a genuinely useful production signal (ntfy
+// rejected a forward), so it isn't worth it for one unit test.
+
+test "reportFetchResult propagates the underlying fetch error unchanged" {
+    try std.testing.expectError(
+        error.UnsupportedCompressionMethod,
+        reportFetchResult(error.UnsupportedCompressionMethod),
+    );
 }
 
 // `zig build test` only collects tests declared directly in this root file;
@@ -312,4 +466,5 @@ test {
     std.testing.refAllDecls(github);
     std.testing.refAllDecls(config);
     std.testing.refAllDecls(json_log);
+    std.testing.refAllDecls(metrics);
 }

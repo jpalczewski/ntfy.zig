@@ -5,6 +5,7 @@
 // and registering it in main.zig — the request-handling loop itself never
 // changes.
 const std = @import("std");
+const config = @import("config.zig");
 
 pub const Summary = struct {
     title: []const u8,
@@ -57,4 +58,8 @@ pub const Route = struct {
     channel: Channel,
     ntfy_url: []const u8,
     ntfy_token: []const u8,
+    /// Which configured channel type this route is — used only to label
+    /// metrics (see metrics.zig), since a `Channel` implementation doesn't
+    /// otherwise need to know its own type.
+    kind: config.ChannelType,
 };

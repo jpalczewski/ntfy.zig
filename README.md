@@ -111,7 +111,12 @@ A further input source (Grafana, a generic webhook, ...) means adding a
 Each `ntfy_token` should be scoped to `write-only` on that one topic
 (`ntfy token add <user>`) — don't hand this relay an admin token.
 
-Listens on `:8085`.
+Listens on `:8085` for webhooks. `GET /health` (liveness check) and
+`GET /metrics` (request/forward counters in Prometheus text format, see
+`src/metrics.zig`) are on a separate `:9090` instead, so exposing the
+webhook port to the internet doesn't also expose them — the Dockerfile
+doesn't `EXPOSE` 9090; reach it over the container network (e.g. point a
+Prometheus scrape target at `<container>:9090`) rather than publishing it.
 
 ## Build
 
