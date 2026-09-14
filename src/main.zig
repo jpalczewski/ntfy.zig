@@ -71,13 +71,23 @@ pub fn main(init: std.process.Init) !void {
         };
         try routes.append(gpa, .{
             .channel = route_channel,
-            .ntfy_url = cc.ntfy_url,
-            .ntfy_token = cc.ntfy_token,
+            .ntfy_uri = try std.Uri.parse(cc.ntfy_url),
+            .ntfy_auth_value = try std.fmt.allocPrint(config_arena, "Bearer {s}", .{cc.ntfy_token}),
             .kind = cc.type,
         });
     }
 
     var app_metrics: metrics.Metrics = .{};
+
+    // Shared across all forward-to-ntfy calls so concurrent webhook handlers
+    // reuse pooled TCP/TLS connections instead of opening a fresh one per
+    // request (see fetchNtfy) — Client.fetch is documented threadsafe, and
+    // its connection_pool/ca_bundle are lock-guarded, so sharing one
+    // instance across concurrent tasks is safe. Like config_arena_state
+    // above, this is deliberately never deinitialized: deinit() asserts no
+    // in-flight requests, and both the accept loop and the internal-server
+    // task run forever.
+    var ntfy_client: http.Client = .{ .allocator = gpa, .io = io };
 
     var address = try net.IpAddress.parseIp4("0.0.0.0", listen_port);
     var server = try address.listen(io, .{ .reuse_address = true });
@@ -121,7 +131,7 @@ pub fn main(init: std.process.Init) !void {
             std.log.err("accept failed: {t}", .{err});
             continue;
         };
-        const args = .{ gpa, io, stream, routes.items, &app_metrics };
+        const args = .{ gpa, io, stream, routes.items, &app_metrics, &ntfy_client };
         tasks.concurrent(io, handleConnectionTask, args) catch |err| switch (err) {
             error.ConcurrencyUnavailable => @call(.auto, handleConnectionTask, args),
         };
@@ -134,8 +144,9 @@ fn handleConnectionTask(
     stream: net.Stream,
     routes: []const Route,
     app_metrics: *metrics.Metrics,
+    ntfy_client: *http.Client,
 ) void {
-    handleConnection(gpa, io, stream, routes, app_metrics) catch |err| {
+    handleConnection(gpa, io, stream, routes, app_metrics, ntfy_client) catch |err| {
         std.log.err("connection error: {t}", .{err});
     };
 }
@@ -250,6 +261,7 @@ fn handleConnection(
     stream_in: net.Stream,
     routes: []const Route,
     app_metrics: *metrics.Metrics,
+    ntfy_client: *http.Client,
 ) !void {
     var stream = stream_in;
     defer stream.close(io);
@@ -331,7 +343,7 @@ fn handleConnection(
     app_metrics.recordRequest(route.kind, outcome);
 
     const forward_start = Io.Clock.awake.now(io);
-    forwardToNtfy(gpa, io, route.ntfy_url, route.ntfy_token, summary) catch |err| {
+    forwardToNtfy(io, ntfy_client, route.ntfy_uri, route.ntfy_auth_value, summary) catch |err| {
         switch (err) {
             // Already logged with the specific status/timeout detail below.
             error.NtfyTimeout, error.NtfyRejected => {},
@@ -351,15 +363,12 @@ const NtfyOutcome = union(enum) {
 };
 
 fn forwardToNtfy(
-    gpa: std.mem.Allocator,
     io: Io,
-    ntfy_url: []const u8,
-    ntfy_token: []const u8,
+    ntfy_client: *http.Client,
+    ntfy_uri: std.Uri,
+    auth_value: []const u8,
     summary: Summary,
 ) !void {
-    const auth_value = try std.fmt.allocPrint(gpa, "Bearer {s}", .{ntfy_token});
-    defer gpa.free(auth_value);
-
     // Race the ntfy request against a timer so a hung/slow ntfy endpoint
     // can't pin this connection's thread forever. Both legs must use
     // `.concurrent`, not `.async`: `.async` is allowed to run its function
@@ -376,9 +385,9 @@ fn forwardToNtfy(
     // explicit calls below already ran it).
     defer select.cancelDiscard();
 
-    select.concurrent(.fetch, fetchNtfy, .{ gpa, io, ntfy_url, auth_value, summary }) catch |err| switch (err) {
+    select.concurrent(.fetch, fetchNtfy, .{ ntfy_client, ntfy_uri, auth_value, summary }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => {
-            const result = fetchNtfy(gpa, io, ntfy_url, auth_value, summary);
+            const result = fetchNtfy(ntfy_client, ntfy_uri, auth_value, summary);
             return reportFetchResult(result);
         },
     };
@@ -399,17 +408,13 @@ fn forwardToNtfy(
 }
 
 fn fetchNtfy(
-    gpa: std.mem.Allocator,
-    io: Io,
-    ntfy_url: []const u8,
+    client: *http.Client,
+    ntfy_uri: std.Uri,
     auth_value: []const u8,
     summary: Summary,
 ) http.Client.FetchError!http.Client.FetchResult {
-    var client: http.Client = .{ .allocator = gpa, .io = io };
-    defer client.deinit();
-
     return client.fetch(.{
-        .location = .{ .url = ntfy_url },
+        .location = .{ .uri = ntfy_uri },
         .method = .POST,
         .payload = summary.message,
         .headers = .{ .authorization = .{ .override = auth_value } },
