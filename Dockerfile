@@ -1,5 +1,5 @@
 # Builds a fully static musl binary and ships it with no runtime at all.
-FROM alpine:3.20 AS builder
+FROM alpine:3.24 AS builder
 
 RUN apk add --no-cache curl xz ca-certificates
 
