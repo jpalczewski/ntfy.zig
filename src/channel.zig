@@ -56,8 +56,13 @@ pub fn findHeader(raw_headers: []const u8, name: []const u8) ?[]const u8 {
 /// (`Channel`) doesn't need to know or care where its output ends up.
 pub const Route = struct {
     channel: Channel,
-    ntfy_url: []const u8,
-    ntfy_token: []const u8,
+    /// Pre-parsed so `fetchNtfy` (main.zig) doesn't re-parse the same URL on
+    /// every single forwarded webhook — this is static per route.
+    ntfy_uri: std.Uri,
+    /// Pre-formatted `"Bearer <token>"`, for the same reason: the token
+    /// never changes after startup, so there's no need to allocPrint it on
+    /// every forward.
+    ntfy_auth_value: []const u8,
     /// Which configured channel type this route is — used only to label
     /// metrics (see metrics.zig), since a `Channel` implementation doesn't
     /// otherwise need to know its own type.

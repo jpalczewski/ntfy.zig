@@ -47,12 +47,8 @@ class FakeNtfyHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib signature
         if self.path == "/stats":
-            body = json.dumps(_stats).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            with _stats_lock:
+                self._respond(200, dict(_stats))
             return
         self.send_response(200)
         self.send_header("Content-Length", "2")

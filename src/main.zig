@@ -71,8 +71,8 @@ pub fn main(init: std.process.Init) !void {
         };
         try routes.append(gpa, .{
             .channel = route_channel,
-            .ntfy_url = cc.ntfy_url,
-            .ntfy_token = cc.ntfy_token,
+            .ntfy_uri = try std.Uri.parse(cc.ntfy_url),
+            .ntfy_auth_value = try std.fmt.allocPrint(config_arena, "Bearer {s}", .{cc.ntfy_token}),
             .kind = cc.type,
         });
     }
@@ -343,7 +343,7 @@ fn handleConnection(
     app_metrics.recordRequest(route.kind, outcome);
 
     const forward_start = Io.Clock.awake.now(io);
-    forwardToNtfy(gpa, io, ntfy_client, route.ntfy_url, route.ntfy_token, summary) catch |err| {
+    forwardToNtfy(io, ntfy_client, route.ntfy_uri, route.ntfy_auth_value, summary) catch |err| {
         switch (err) {
             // Already logged with the specific status/timeout detail below.
             error.NtfyTimeout, error.NtfyRejected => {},
@@ -363,16 +363,12 @@ const NtfyOutcome = union(enum) {
 };
 
 fn forwardToNtfy(
-    gpa: std.mem.Allocator,
     io: Io,
     ntfy_client: *http.Client,
-    ntfy_url: []const u8,
-    ntfy_token: []const u8,
+    ntfy_uri: std.Uri,
+    auth_value: []const u8,
     summary: Summary,
 ) !void {
-    const auth_value = try std.fmt.allocPrint(gpa, "Bearer {s}", .{ntfy_token});
-    defer gpa.free(auth_value);
-
     // Race the ntfy request against a timer so a hung/slow ntfy endpoint
     // can't pin this connection's thread forever. Both legs must use
     // `.concurrent`, not `.async`: `.async` is allowed to run its function
@@ -389,9 +385,9 @@ fn forwardToNtfy(
     // explicit calls below already ran it).
     defer select.cancelDiscard();
 
-    select.concurrent(.fetch, fetchNtfy, .{ ntfy_client, ntfy_url, auth_value, summary }) catch |err| switch (err) {
+    select.concurrent(.fetch, fetchNtfy, .{ ntfy_client, ntfy_uri, auth_value, summary }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => {
-            const result = fetchNtfy(ntfy_client, ntfy_url, auth_value, summary);
+            const result = fetchNtfy(ntfy_client, ntfy_uri, auth_value, summary);
             return reportFetchResult(result);
         },
     };
@@ -413,12 +409,12 @@ fn forwardToNtfy(
 
 fn fetchNtfy(
     client: *http.Client,
-    ntfy_url: []const u8,
+    ntfy_uri: std.Uri,
     auth_value: []const u8,
     summary: Summary,
 ) http.Client.FetchError!http.Client.FetchResult {
     return client.fetch(.{
-        .location = .{ .url = ntfy_url },
+        .location = .{ .uri = ntfy_uri },
         .method = .POST,
         .payload = summary.message,
         .headers = .{ .authorization = .{ .override = auth_value } },

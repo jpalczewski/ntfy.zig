@@ -43,7 +43,17 @@ CHANNEL_2_NTFY_TOKEN=tk_stress \
 ../zig-out/bin/ntfy.zig &
 pids+=($!)
 
-sleep 1
+echo "== waiting for ntfy.zig to become ready =="
+for i in $(seq 1 50); do
+    if curl -sf "http://127.0.0.1:9090/health" > /dev/null 2>&1; then
+        break
+    fi
+    if [ "$i" -eq 50 ]; then
+        echo "ntfy.zig did not become ready in time" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
 
 echo "== running locust headless: ${LOCUST_USERS} users, spawn rate ${LOCUST_SPAWN_RATE}/s, ${LOCUST_RUN_TIME} =="
 COOLIFY_SECRET="$COOLIFY_SECRET" \

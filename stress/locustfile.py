@@ -56,31 +56,50 @@ class NtfyZigUser(HttpUser):
 
     wait_time = between(0.05, 0.5)
 
+    def _post_coolify(self, payload: dict, label: str):
+        self.client.post(COOLIFY_PATH, json=payload, name=f"{COOLIFY_PATH} [{label}]")
+
+    def _post_github(self, body: bytes, event: str, label: str, *, signature: str | None = None):
+        self.client.post(
+            GITHUB_PATH,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-GitHub-Event": event,
+                "X-Hub-Signature-256": signature or _github_signature(body),
+            },
+            name=f"{GITHUB_PATH} [{label}]",
+        )
+
     # --- Coolify deployment webhooks -------------------------------------
 
     @task(5)
     def coolify_deploy_success(self):
-        payload = {
-            "event": "deployment",
-            "message": "Deployment finished",
-            "success": True,
-            "application_name": random.choice(APPS),
-            "project": random.choice(PROJECTS),
-            "environment": random.choice(ENVIRONMENTS),
-        }
-        self.client.post(COOLIFY_PATH, json=payload, name=f"{COOLIFY_PATH} [deploy ok]")
+        self._post_coolify(
+            {
+                "event": "deployment",
+                "message": "Deployment finished",
+                "success": True,
+                "application_name": random.choice(APPS),
+                "project": random.choice(PROJECTS),
+                "environment": random.choice(ENVIRONMENTS),
+            },
+            "deploy ok",
+        )
 
     @task(2)
     def coolify_deploy_failure(self):
-        payload = {
-            "event": "deployment",
-            "message": "Deployment failed: build exited with code 1",
-            "success": False,
-            "application_name": random.choice(APPS),
-            "project": random.choice(PROJECTS),
-            "environment": random.choice(ENVIRONMENTS),
-        }
-        self.client.post(COOLIFY_PATH, json=payload, name=f"{COOLIFY_PATH} [deploy fail]")
+        self._post_coolify(
+            {
+                "event": "deployment",
+                "message": "Deployment failed: build exited with code 1",
+                "success": False,
+                "application_name": random.choice(APPS),
+                "project": random.choice(PROJECTS),
+                "environment": random.choice(ENVIRONMENTS),
+            },
+            "deploy fail",
+        )
 
     @task(1)
     def coolify_malformed(self):
@@ -108,16 +127,7 @@ class NtfyZigUser(HttpUser):
                 "repository": {"full_name": f"acme/{random.choice(APPS)}"},
             }
         ).encode()
-        self.client.post(
-            GITHUB_PATH,
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "X-GitHub-Event": "workflow_run",
-                "X-Hub-Signature-256": _github_signature(body),
-            },
-            name=f"{GITHUB_PATH} [workflow_run]",
-        )
+        self._post_github(body, "workflow_run", "workflow_run")
 
     @task(3)
     def github_deployment_status(self):
@@ -128,58 +138,22 @@ class NtfyZigUser(HttpUser):
                 "repository": {"full_name": f"acme/{random.choice(APPS)}"},
             }
         ).encode()
-        self.client.post(
-            GITHUB_PATH,
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "X-GitHub-Event": "deployment_status",
-                "X-Hub-Signature-256": _github_signature(body),
-            },
-            name=f"{GITHUB_PATH} [deployment_status]",
-        )
+        self._post_github(body, "deployment_status", "deployment_status")
 
     @task(1)
     def github_ping(self):
         body = json.dumps({"zen": "Keep it logically awesome.", "hook_id": random.randint(1, 999999)}).encode()
-        self.client.post(
-            GITHUB_PATH,
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "X-GitHub-Event": "ping",
-                "X-Hub-Signature-256": _github_signature(body),
-            },
-            name=f"{GITHUB_PATH} [ping]",
-        )
+        self._post_github(body, "ping", "ping")
 
     @task(1)
     def github_ignored_event(self):
         # An event type ntfy.zig doesn't act on -- should be a cheap 200 (Ignored).
         body = json.dumps({"issue": {"title": str(uuid.uuid4())}}).encode()
-        self.client.post(
-            GITHUB_PATH,
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "X-GitHub-Event": "issues",
-                "X-Hub-Signature-256": _github_signature(body),
-            },
-            name=f"{GITHUB_PATH} [ignored event]",
-        )
+        self._post_github(body, "issues", "ignored event")
 
     @task(1)
     def github_bad_signature(self):
         # Wrong secret -- should be a fast 401, exercising the rejection path.
         body = json.dumps({"action": "completed"}).encode()
         bad_sig = "sha256=" + hmac.new(b"wrong-secret", body, hashlib.sha256).hexdigest()
-        self.client.post(
-            GITHUB_PATH,
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "X-GitHub-Event": "workflow_run",
-                "X-Hub-Signature-256": bad_sig,
-            },
-            name=f"{GITHUB_PATH} [bad signature]",
-        )
+        self._post_github(body, "workflow_run", "bad signature", signature=bad_sig)
