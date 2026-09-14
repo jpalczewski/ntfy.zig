@@ -257,7 +257,10 @@ fn forwardToNtfy(gpa: std.mem.Allocator, io: Io, ntfy_url: []const u8, ntfy_toke
 
     switch (try select.await()) {
         .fetch => |result| try reportFetchResult(result),
-        .timed_out => std.log.err("ntfy request timed out after {d}s", .{@divTrunc(ntfy_timeout.nanoseconds, std.time.ns_per_s)}),
+        .timed_out => std.log.err(
+            "ntfy request timed out after {d}s",
+            .{@divTrunc(ntfy_timeout.nanoseconds, std.time.ns_per_s)},
+        ),
     }
 }
 
