@@ -12,6 +12,9 @@ pub const Summary = struct {
     message: []const u8,
     priority: []const u8,
     tags: []const u8,
+    /// Set by a channel whose event matched its `deploy` block: tells
+    /// main.zig to call Coolify's deploy webhook for this route.
+    deploy: bool = false,
 };
 
 pub const Channel = struct {
@@ -67,4 +70,13 @@ pub const Route = struct {
     /// metrics (see metrics.zig), since a `Channel` implementation doesn't
     /// otherwise need to know its own type.
     kind: config.ChannelType,
+    /// Coolify deploy webhook to call when `Summary.deploy` is set; null for
+    /// channels without a `deploy` block. Pre-parsed like `ntfy_uri`.
+    deploy: ?Deploy = null,
+};
+
+pub const Deploy = struct {
+    uri: std.Uri,
+    /// Pre-formatted `"Bearer <token>"`.
+    auth_value: []const u8,
 };

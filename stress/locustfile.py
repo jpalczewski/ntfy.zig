@@ -8,19 +8,10 @@ Drives both channel types it supports (see src/coolify.zig, src/github.zig):
 
 Point this at a running ntfy.zig with:
 
-    CHANNEL_1_TYPE=coolify
-    CHANNEL_1_SECRET=<COOLIFY_SECRET>
-    CHANNEL_1_NTFY_URL=http://127.0.0.1:9999/stress-coolify
-    CHANNEL_1_NTFY_TOKEN=<anything, fake_ntfy.py doesn't check it by default>
-    CHANNEL_2_TYPE=github
-    CHANNEL_2_SECRET=<GITHUB_SECRET>
-    CHANNEL_2_NTFY_URL=http://127.0.0.1:9999/stress-github
-    CHANNEL_2_NTFY_TOKEN=<anything>
+    CONFIG_FILE=<json with a coolify channel and a github channel, see run.sh>
 
-and run: uv run locust -f locustfile.py --host http://127.0.0.1:8085
-
-COOLIFY_SECRET/GITHUB_SECRET here must match the CHANNEL_*_SECRET values
-above — see README.md for the matching defaults.
+COOLIFY_SECRET/GITHUB_SECRET here must match the channel `secret`
+values in that config file — see README.md for the matching defaults.
 """
 
 from __future__ import annotations

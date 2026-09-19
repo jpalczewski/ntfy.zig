@@ -34,23 +34,18 @@ uv sync
 # terminal 1: fake ntfy endpoint
 uv run python fake_ntfy.py
 
-# terminal 2: ntfy.zig itself, from the repo root
-CHANNEL_1_TYPE=coolify \
-CHANNEL_1_SECRET=stress-coolify-secret \
-CHANNEL_1_NTFY_URL=http://127.0.0.1:9999/stress-coolify \
-CHANNEL_1_NTFY_TOKEN=tk_stress \
-CHANNEL_2_TYPE=github \
-CHANNEL_2_SECRET=stress-github-secret \
-CHANNEL_2_NTFY_URL=http://127.0.0.1:9999/stress-github \
-CHANNEL_2_NTFY_TOKEN=tk_stress \
-zig build run
+# terminal 2: ntfy.zig itself, from the repo root. stress-config.json is any
+# config with a coolify channel (secret stress-coolify-secret) and a github
+# channel (secret stress-github-secret), both pointing at http://127.0.0.1:9999/...
+# — see `run.sh` for the exact shape.
+CONFIG_FILE=stress-config.json zig build run
 
 # terminal 3: Locust web UI at http://localhost:8089
 uv run locust -f locustfile.py --host http://127.0.0.1:8085
 ```
 
 If you change `COOLIFY_SECRET`/`GITHUB_SECRET` env vars for `locustfile.py`,
-set matching `CHANNEL_*_SECRET` values for ntfy.zig — the GitHub webhook
+set matching `secret` values in ntfy.zig's config file — the GitHub webhook
 path is derived from the secret (see `src/github.zig`), so they must match
 for requests to route correctly.
 

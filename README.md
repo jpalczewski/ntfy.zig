@@ -30,59 +30,11 @@ title/message/priority, and forwards it to ntfy with a proper
 
 ## Config
 
-The relay serves one or more **channels**. Each channel picks its own ntfy
-target, so e.g. Coolify can post to one topic/token and another source can
-post to a different one. Configure channels with *either* numbered
-environment variables or a JSON file — whichever fits how you deploy
-(Coolify's own UI only offers env vars; a file scales better once you have
-several channels).
-
-Two channel types are supported today:
-
-- **`coolify`** — authenticated by a secret path segment
-  (`/webhook/<secret>`), since Coolify's webhook config has nowhere to put a
-  header or token. The path *is* the auth.
-- **`github`** — GitHub Actions (`workflow_run`) and Deployments
-  (`deployment_status`) events. Unlike Coolify, GitHub webhooks support a
-  real shared secret: each delivery is signed with HMAC-SHA256 in the
-  `X-Hub-Signature-256` header, and this relay verifies it. A request with a
-  missing or invalid signature is rejected with `401` and never forwarded.
-  Everything else (other event types, or a `workflow_run`/`deployment_status`
-  that isn't yet in a terminal state) is acknowledged with `200` and silently
-  dropped, so a webhook subscribed to "everything" won't spam ntfy.
-
-### Option A: numbered environment variables
-
-```
-CHANNEL_1_TYPE=coolify
-CHANNEL_1_SECRET=<secret>
-CHANNEL_1_NTFY_URL=https://ntfy.example.com/coolify
-CHANNEL_1_NTFY_TOKEN=<ntfy token>
-
-CHANNEL_2_TYPE=github
-CHANNEL_2_SECRET=<webhook secret>
-CHANNEL_2_NTFY_URL=https://ntfy.example.com/github
-CHANNEL_2_NTFY_TOKEN=<other ntfy token>
-```
-
-The relay reads `CHANNEL_1_*`, then `CHANNEL_2_*`, and so on until
-`CHANNEL_<n>_TYPE` is unset.
-
-- For `coolify`, `SECRET` is the URL path segment: point Coolify's webhook at
-  `http://host:8085/webhook/<CHANNEL_n_SECRET>` — any other path (or method)
-  gets a 404.
-- For `github`, `SECRET` is the HMAC signing secret — paste the *same* value
-  into this webhook's "Secret" field in GitHub's repo settings (Settings →
-  Webhooks → Add webhook). The payload URL isn't the secret itself; it's
-  logged at startup (`github channel: payload URL path is
-  /webhook/github/<hex>`), so start the relay first and read the URL to use
-  from its logs. Content type: `application/json`. Under "Which events
-  would you like to trigger this webhook?", select individual events:
-  **Workflow runs** and **Deployment statuses**.
-
-### Option B: a JSON config file
-
-Set `CONFIG_FILE=/path/to/config.json` to a file shaped like:
+The relay serves one or more **channels**, configured in a JSON file whose
+path is given by `CONFIG_FILE`. Each channel picks its own ntfy target, so
+e.g. Coolify can post to one topic/token and GitHub to another. In Coolify,
+put the file in via Persistent Storage → Add → File Mount (destination path
+e.g. `/config.json`) and set `CONFIG_FILE=/config.json`.
 
 ```json
 {
@@ -97,16 +49,68 @@ Set `CONFIG_FILE=/path/to/config.json` to a file shaped like:
       "type": "github",
       "secret": "<webhook secret>",
       "ntfy_url": "https://ntfy.example.com/github",
-      "ntfy_token": "<other ntfy token>"
+      "ntfy_token": "<other ntfy token>",
+      "deploy": {
+        "workflow": "Docker build",
+        "branch": "main",
+        "url": "https://coolify.example.com/api/v1/deploy?uuid=<app uuid>&force=false",
+        "token": "<Coolify API token>"
+      }
     }
   ]
 }
 ```
 
-`CONFIG_FILE` takes precedence over the numbered env vars if both are set.
-A further input source (Grafana, a generic webhook, ...) means adding a
-`Channel` implementation (see `src/channel.zig`) and a new enum value in
-`src/config.zig`, not a config format change.
+Unknown fields are rejected at startup, so a typo in a key fails loudly
+instead of silently disabling something.
+
+Two channel types are supported today:
+
+- **`coolify`** — authenticated by a secret path segment: point Coolify's
+  webhook at `http://host:8085/webhook/<secret>` — any other path (or method)
+  gets a 404. The path *is* the auth, since Coolify's webhook config has
+  nowhere to put a header or token.
+- **`github`** — GitHub Actions (`workflow_run`) and Deployments
+  (`deployment_status`) events. Unlike Coolify, GitHub webhooks support a
+  real shared secret: each delivery is signed with HMAC-SHA256 in the
+  `X-Hub-Signature-256` header, and this relay verifies it. A request with a
+  missing or invalid signature is rejected with `401` and never forwarded.
+  Everything else (other event types, or a `workflow_run`/`deployment_status`
+  that isn't yet in a terminal state) is acknowledged with `200` and silently
+  dropped, so a webhook subscribed to "everything" won't spam ntfy.
+  `secret` is the same value you paste into the webhook's "Secret" field in
+  GitHub (Settings → Webhooks → Add webhook). The payload URL isn't the
+  secret itself; it's logged at startup (`github channel: payload URL path is
+  /webhook/github/<hex>`), so start the relay first and read the URL to use
+  from its logs. Content type: `application/json`. Under "Which events would
+  you like to trigger this webhook?", select individual events: **Workflow
+  runs** and **Deployment statuses**.
+
+### Deploying from a GitHub workflow
+
+A `github` channel can also redeploy an app when your image build finishes:
+
+```
+push to main → GitHub Actions builds & pushes to GHCR
+  → GitHub sends a `workflow_run` webhook to the relay
+  → relay verifies the signature, sees a successful "Docker build" run on `main`
+  → relay calls Coolify's deploy URL with `Authorization: Bearer <token>`
+  → relay sends one ntfy message with the run result + "Coolify deploy triggered"
+```
+
+The `deploy` block is both the trigger and the action: it fires on a
+**successful** `workflow_run` whose workflow name is exactly `workflow` and
+whose branch is `branch` (default `main`), then does a `GET` on `url` with
+`token`. If Coolify rejects it or doesn't answer within 10s, the ntfy
+notification says `Coolify deploy FAILED` and goes out at top priority.
+`url` is Coolify's deploy webhook (`/api/v1/deploy?uuid=<uuid>`); `token` is
+an API token with deploy permission (Keys & Tokens → API Tokens; the API
+must be enabled in Coolify's settings). `deploy` is only allowed on `github`
+channels. Note the trigger is the workflow *finishing*, which is after the
+image push, so Coolify never pulls a half-published image.
+
+A redelivered webhook (GitHub's "Redeliver" button) deploys again — there is
+no de-duplication.
 
 Each `ntfy_token` should be scoped to `write-only` on that one topic
 (`ntfy token add <user>`) — don't hand this relay an admin token.
