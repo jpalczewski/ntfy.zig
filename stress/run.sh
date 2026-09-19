@@ -13,8 +13,10 @@ LOCUST_USERS="${LOCUST_USERS:-50}"
 LOCUST_SPAWN_RATE="${LOCUST_SPAWN_RATE:-10}"
 LOCUST_RUN_TIME="${LOCUST_RUN_TIME:-1m}"
 
+config_file="$(mktemp)"
 pids=()
 cleanup() {
+    rm -f "$config_file"
     for pid in "${pids[@]:-}"; do
         kill "$pid" 2>/dev/null || true
     done
@@ -31,15 +33,17 @@ echo "== starting fake ntfy on :${FAKE_NTFY_PORT} =="
 FAKE_NTFY_PORT="$FAKE_NTFY_PORT" uv run python fake_ntfy.py &
 pids+=($!)
 
+cat > "$config_file" <<EOF
+{"channels": [
+  {"type": "coolify", "secret": "${COOLIFY_SECRET}",
+   "ntfy_url": "http://127.0.0.1:${FAKE_NTFY_PORT}/stress-coolify", "ntfy_token": "tk_stress"},
+  {"type": "github", "secret": "${GITHUB_SECRET}",
+   "ntfy_url": "http://127.0.0.1:${FAKE_NTFY_PORT}/stress-github", "ntfy_token": "tk_stress"}
+]}
+EOF
+
 echo "== starting ntfy.zig on :${NTFY_ZIG_PORT} (health/metrics on :9090) =="
-CHANNEL_1_TYPE=coolify \
-CHANNEL_1_SECRET="$COOLIFY_SECRET" \
-CHANNEL_1_NTFY_URL="http://127.0.0.1:${FAKE_NTFY_PORT}/stress-coolify" \
-CHANNEL_1_NTFY_TOKEN=tk_stress \
-CHANNEL_2_TYPE=github \
-CHANNEL_2_SECRET="$GITHUB_SECRET" \
-CHANNEL_2_NTFY_URL="http://127.0.0.1:${FAKE_NTFY_PORT}/stress-github" \
-CHANNEL_2_NTFY_TOKEN=tk_stress \
+CONFIG_FILE="$config_file" \
 ../zig-out/bin/ntfy.zig &
 pids+=($!)
 

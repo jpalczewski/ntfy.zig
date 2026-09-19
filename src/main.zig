@@ -3,9 +3,11 @@
 // talk to ntfy directly — ntfy needs auth plus a title/message/priority
 // shape, not a raw payload dumped as the message body. Coolify's built-in
 // "Webhook" notification channel (see Coolify's SendWebhookJob/
-// WebhookChannel) is the only input wired up today; new sources mean adding
-// a Channel implementation, an enum value in config.zig, and a switch arm
-// below — the request-handling loop itself never changes.
+// WebhookChannel) and GitHub webhooks are wired up today; new sources mean
+// adding a Channel implementation, an enum value in config.zig, and a switch
+// arm below — the request-handling loop itself never changes. A github
+// channel with a `deploy` block additionally calls Coolify's deploy webhook
+// when a matching workflow run succeeds (see `triggerDeploy`).
 const std = @import("std");
 const http = std.http;
 const Io = std.Io;
@@ -27,7 +29,7 @@ const listen_port: u16 = 8085;
 /// `<container>:9090`) or `docker exec`/a debug port-forward.
 const internal_port: u16 = 9090;
 const max_body_bytes: usize = 64 * 1024;
-const ntfy_timeout: Io.Duration = .{ .nanoseconds = 10 * std.time.ns_per_s };
+const request_timeout: Io.Duration = .{ .nanoseconds = 10 * std.time.ns_per_s };
 
 pub const std_options: std.Options = .{
     .logFn = json_log.jsonLog,
@@ -61,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
             },
             .github => blk: {
                 const c = try gpa.create(github.Github);
-                c.* = try github.Github.init(gpa, cc.secret);
+                c.* = try github.Github.init(gpa, cc.secret, cc.deploy);
                 // The path is derived from the secret (not the secret itself, see
                 // github.zig), so it isn't knowable ahead of time — log it so it can
                 // be pasted into GitHub's webhook "Payload URL" field.
@@ -74,6 +76,10 @@ pub fn main(init: std.process.Init) !void {
             .ntfy_uri = try std.Uri.parse(cc.ntfy_url),
             .ntfy_auth_value = try std.fmt.allocPrint(config_arena, "Bearer {s}", .{cc.ntfy_token}),
             .kind = cc.type,
+            .deploy = if (cc.deploy) |d| .{
+                .uri = try std.Uri.parse(d.url),
+                .auth_value = try std.fmt.allocPrint(config_arena, "Bearer {s}", .{d.token}),
+            } else null,
         });
     }
 
@@ -317,7 +323,7 @@ fn handleConnection(
     defer if (has_framed_body) gpa.free(body);
 
     var outcome: metrics.Outcome = .forwarded;
-    const summary = route.channel.summarize(arena, body, raw_headers) catch |err| switch (err) {
+    var summary = route.channel.summarize(arena, body, raw_headers) catch |err| switch (err) {
         error.InvalidSignature => {
             std.log.warn("rejected webhook: invalid signature", .{});
             app_metrics.recordRequest(route.kind, .invalid_signature);
@@ -342,11 +348,20 @@ fn handleConnection(
     };
     app_metrics.recordRequest(route.kind, outcome);
 
+    // Deploy before notifying, so the ntfy message can say whether Coolify
+    // accepted it. Coolify only queues the deploy and returns, so this stays
+    // fast even when the deployed app is this relay itself.
+    if (summary.deploy) if (route.deploy) |deploy| {
+        const deploy_result = triggerDeploy(io, ntfy_client, deploy);
+        if (deploy_result) |_| {} else |err| std.log.err("coolify deploy failed: {t}", .{err});
+        summary = applyDeployResult(arena, summary, deploy_result);
+    };
+
     const forward_start = Io.Clock.awake.now(io);
     forwardToNtfy(io, ntfy_client, route.ntfy_uri, route.ntfy_auth_value, summary) catch |err| {
         switch (err) {
             // Already logged with the specific status/timeout detail below.
-            error.NtfyTimeout, error.NtfyRejected => {},
+            error.Timeout, error.Rejected => {},
             else => std.log.err("failed to forward to ntfy: {t}", .{err}),
         }
         app_metrics.recordForwardFailure(route.kind);
@@ -357,9 +372,20 @@ fn handleConnection(
     try request.respond("ok", .{ .status = .ok, .keep_alive = false });
 }
 
-const NtfyOutcome = union(enum) {
+const FetchOutcome = union(enum) {
     fetch: http.Client.FetchError!http.Client.FetchResult,
     timed_out: void,
+};
+
+/// One outbound HTTP call (ntfy publish or Coolify deploy).
+const Outbound = struct {
+    /// Names the call in logs, e.g. "ntfy" or "coolify deploy".
+    label: []const u8,
+    uri: std.Uri,
+    method: http.Method,
+    auth_value: []const u8,
+    payload: ?[]const u8 = null,
+    extra_headers: []const http.Header = &.{},
 };
 
 fn forwardToNtfy(
@@ -369,15 +395,61 @@ fn forwardToNtfy(
     auth_value: []const u8,
     summary: Summary,
 ) !void {
-    // Race the ntfy request against a timer so a hung/slow ntfy endpoint
-    // can't pin this connection's thread forever. Both legs must use
-    // `.concurrent`, not `.async`: `.async` is allowed to run its function
-    // inline (blocking, to completion) instead of on a separate task once
-    // the Io implementation's thread limit is reached — on a single-core
-    // container that limit is 0, which would turn the "race" into just
-    // running one leg fully before the other ever starts.
-    var outcome_buf: [2]NtfyOutcome = undefined;
-    var select: Io.Select(NtfyOutcome) = .init(io, &outcome_buf);
+    try sendWithTimeout(io, ntfy_client, .{
+        .label = "ntfy",
+        .uri = ntfy_uri,
+        .method = .POST,
+        .auth_value = auth_value,
+        .payload = summary.message,
+        .extra_headers = &.{
+            .{ .name = "X-Title", .value = summary.title },
+            .{ .name = "X-Priority", .value = summary.priority },
+            .{ .name = "X-Tags", .value = summary.tags },
+        },
+    });
+}
+
+fn triggerDeploy(io: Io, client: *http.Client, deploy: channel.Deploy) !void {
+    try sendWithTimeout(io, client, .{
+        .label = "coolify deploy",
+        .uri = deploy.uri,
+        .method = .GET,
+        .auth_value = deploy.auth_value,
+    });
+}
+
+/// Folds the deploy call's outcome into the notification, so one ntfy
+/// message tells the whole story. A failed deploy is bumped to top priority.
+fn applyDeployResult(arena: std.mem.Allocator, summary: Summary, result: anyerror!void) Summary {
+    var updated = summary;
+    if (result) {
+        updated.message = std.fmt.allocPrint(
+            arena,
+            "{s}\nCoolify deploy triggered",
+            .{summary.message},
+        ) catch summary.message;
+    } else |err| {
+        updated.message = std.fmt.allocPrint(
+            arena,
+            "{s}\nCoolify deploy FAILED: {t}",
+            .{ summary.message, err },
+        ) catch summary.message;
+        updated.priority = "5";
+        updated.tags = "x";
+    }
+    return updated;
+}
+
+fn sendWithTimeout(io: Io, client: *http.Client, request: Outbound) !void {
+    // Race the request against a timer so a hung/slow endpoint can't pin
+    // this connection's thread forever. Both legs must use `.concurrent`,
+    // not `.async`: `.async` is allowed to run its function inline
+    // (blocking, to completion) instead of on a separate task once the Io
+    // implementation's thread limit is reached — on a single-core container
+    // that limit is 0, which would turn the "race" into just running one leg
+    // fully before the other ever starts.
+    var outcome_buf: [2]FetchOutcome = undefined;
+    var select: Io.Select(FetchOutcome) = .init(io, &outcome_buf);
     // Guarantees the still-running leg (if any) is interrupted and reaped
     // before this stack frame — and the `select`/`outcome_buf` it points
     // into — goes away, on every return path including `error.Canceled`
@@ -385,44 +457,35 @@ fn forwardToNtfy(
     // explicit calls below already ran it).
     defer select.cancelDiscard();
 
-    select.concurrent(.fetch, fetchNtfy, .{ ntfy_client, ntfy_uri, auth_value, summary }) catch |err| switch (err) {
+    select.concurrent(.fetch, fetchOutbound, .{ client, request }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => {
-            const result = fetchNtfy(ntfy_client, ntfy_uri, auth_value, summary);
-            return reportFetchResult(result);
+            const result = fetchOutbound(client, request);
+            return reportFetchResult(request.label, result);
         },
     };
-    select.concurrent(.timed_out, sleepFor, .{ io, ntfy_timeout }) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => return reportFetchResult((try select.await()).fetch),
+    select.concurrent(.timed_out, sleepFor, .{ io, request_timeout }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return reportFetchResult(request.label, (try select.await()).fetch),
     };
 
     switch (try select.await()) {
-        .fetch => |result| try reportFetchResult(result),
+        .fetch => |result| try reportFetchResult(request.label, result),
         .timed_out => {
             std.log.err(
-                "ntfy request timed out after {d}s",
-                .{@divTrunc(ntfy_timeout.nanoseconds, std.time.ns_per_s)},
+                "{s} request timed out after {d}s",
+                .{ request.label, @divTrunc(request_timeout.nanoseconds, std.time.ns_per_s) },
             );
-            return error.NtfyTimeout;
+            return error.Timeout;
         },
     }
 }
 
-fn fetchNtfy(
-    client: *http.Client,
-    ntfy_uri: std.Uri,
-    auth_value: []const u8,
-    summary: Summary,
-) http.Client.FetchError!http.Client.FetchResult {
+fn fetchOutbound(client: *http.Client, request: Outbound) http.Client.FetchError!http.Client.FetchResult {
     return client.fetch(.{
-        .location = .{ .uri = ntfy_uri },
-        .method = .POST,
-        .payload = summary.message,
-        .headers = .{ .authorization = .{ .override = auth_value } },
-        .extra_headers = &.{
-            .{ .name = "X-Title", .value = summary.title },
-            .{ .name = "X-Priority", .value = summary.priority },
-            .{ .name = "X-Tags", .value = summary.tags },
-        },
+        .location = .{ .uri = request.uri },
+        .method = request.method,
+        .payload = request.payload,
+        .headers = .{ .authorization = .{ .override = request.auth_value } },
+        .extra_headers = request.extra_headers,
     });
 }
 
@@ -435,19 +498,52 @@ fn sleepFor(io: Io, duration: Io.Duration) void {
     io.sleep(duration, .awake) catch {};
 }
 
-fn reportFetchResult(result: http.Client.FetchError!http.Client.FetchResult) !void {
+fn reportFetchResult(label: []const u8, result: http.Client.FetchError!http.Client.FetchResult) !void {
     const fetch_result = try result;
     if (fetch_result.status != .ok) {
-        std.log.err("ntfy responded with status {d}", .{@intFromEnum(fetch_result.status)});
-        return error.NtfyRejected;
+        std.log.err("{s} responded with status {d}", .{ label, @intFromEnum(fetch_result.status) });
+        return error.Rejected;
     }
 }
 
-test "reportFetchResult succeeds for a 200 response" {
-    try reportFetchResult(.{ .status = .ok });
+test "applyDeployResult notes a triggered deploy without changing priority" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const summary: Summary = .{
+        .title = "acme/api",
+        .message = "Docker build — success",
+        .priority = "3",
+        .tags = "white_check_mark",
+    };
+    const updated = applyDeployResult(arena_state.allocator(), summary, {});
+
+    try std.testing.expectEqualStrings("Docker build — success\nCoolify deploy triggered", updated.message);
+    try std.testing.expectEqualStrings("3", updated.priority);
 }
 
-// Not tested here: a non-2xx status returning error.NtfyRejected. Verified
+test "applyDeployResult flags a failed deploy at top priority" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const summary: Summary = .{
+        .title = "acme/api",
+        .message = "Docker build — success",
+        .priority = "3",
+        .tags = "white_check_mark",
+    };
+    const updated = applyDeployResult(arena_state.allocator(), summary, error.Rejected);
+
+    try std.testing.expectEqualStrings("Docker build — success\nCoolify deploy FAILED: Rejected", updated.message);
+    try std.testing.expectEqualStrings("5", updated.priority);
+    try std.testing.expectEqualStrings("x", updated.tags);
+}
+
+test "reportFetchResult succeeds for a 200 response" {
+    try reportFetchResult("test", .{ .status = .ok });
+}
+
+// Not tested here: a non-2xx status returning error.Rejected. Verified
 // manually instead (see PR description) — it calls std.log.err, and Zig's
 // test runner fails the whole `zig build test` step ("N errors were
 // logged") whenever *any* test causes an .err-level log, independent of
@@ -458,7 +554,7 @@ test "reportFetchResult succeeds for a 200 response" {
 test "reportFetchResult propagates the underlying fetch error unchanged" {
     try std.testing.expectError(
         error.UnsupportedCompressionMethod,
-        reportFetchResult(error.UnsupportedCompressionMethod),
+        reportFetchResult("test", error.UnsupportedCompressionMethod),
     );
 }
 

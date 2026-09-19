@@ -11,27 +11,34 @@
 // (Deployments); every other event type, and non-terminal states of those
 // two, resolve to `error.Ignored` so a webhook subscribed to "everything"
 // doesn't spam ntfy.
+//
+// A successful `workflow_run` that matches the channel's `deploy` block
+// (workflow name + branch) also sets `Summary.deploy`, which is what makes
+// main.zig call Coolify's deploy webhook.
 const std = @import("std");
 const chan = @import("channel.zig");
 const Channel = chan.Channel;
 const Summary = chan.Summary;
+const config = @import("config.zig");
 
 pub const Github = struct {
     target_path: []const u8,
     secret: []const u8,
+    deploy: ?config.DeployConfig,
 
     /// The route path is derived from `secret` (first 8 bytes of its
     /// SHA-256 digest, hex-encoded) rather than being the secret itself —
     /// the whole point of HMAC auth is that the secret never has to appear
     /// in a URL (and therefore in server/proxy logs). The derived path is
     /// logged at startup so it can be pasted into GitHub's webhook config.
-    pub fn init(gpa: std.mem.Allocator, secret: []const u8) !Github {
+    pub fn init(gpa: std.mem.Allocator, secret: []const u8, deploy: ?config.DeployConfig) !Github {
         var digest_buf: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(secret, &digest_buf, .{});
         const hex = std.fmt.bytesToHex(digest_buf[0..8].*, .lower);
         return .{
             .target_path = try std.fmt.allocPrint(gpa, "/webhook/github/{s}", .{&hex}),
             .secret = secret,
+            .deploy = deploy,
         };
     }
 
@@ -64,7 +71,7 @@ pub const Github = struct {
 
         const event = chan.findHeader(raw_headers, "X-GitHub-Event") orelse
             return error.Ignored;
-        return summarize(arena, event, body);
+        return summarize(arena, event, body, self.deploy);
     }
 };
 
@@ -83,19 +90,24 @@ fn verifySignature(body: []const u8, secret: []const u8, header_value: []const u
     return std.crypto.timing_safe.eql([32]u8, expected_buf, actual_buf);
 }
 
-pub fn summarize(arena: std.mem.Allocator, event: []const u8, body: []const u8) !Summary {
+pub fn summarize(
+    arena: std.mem.Allocator,
+    event: []const u8,
+    body: []const u8,
+    deploy: ?config.DeployConfig,
+) !Summary {
     if (std.mem.eql(u8, event, "ping")) return .{
         .title = "GitHub",
         .message = "Webhook connected",
         .priority = "1",
         .tags = "handshake",
     };
-    if (std.mem.eql(u8, event, "workflow_run")) return summarizeWorkflowRun(arena, body);
+    if (std.mem.eql(u8, event, "workflow_run")) return summarizeWorkflowRun(arena, body, deploy);
     if (std.mem.eql(u8, event, "deployment_status")) return summarizeDeploymentStatus(arena, body);
     return error.Ignored;
 }
 
-fn summarizeWorkflowRun(arena: std.mem.Allocator, body: []const u8) !Summary {
+fn summarizeWorkflowRun(arena: std.mem.Allocator, body: []const u8, deploy: ?config.DeployConfig) !Summary {
     const obj = try parseObject(arena, body);
 
     const action = getString(obj, "action") orelse "";
@@ -116,7 +128,16 @@ fn summarizeWorkflowRun(arena: std.mem.Allocator, body: []const u8) !Summary {
         try msg_buf.appendSlice(arena, b);
     }
 
-    return buildSummary(repo_name orelse "GitHub Actions", msg_buf.items, std.mem.eql(u8, conclusion, "success"));
+    const succeeded = std.mem.eql(u8, conclusion, "success");
+    var summary = buildSummary(repo_name orelse "GitHub Actions", msg_buf.items, succeeded);
+    summary.deploy = succeeded and matchesDeploy(deploy, getString(run, "name"), branch);
+    return summary;
+}
+
+fn matchesDeploy(deploy: ?config.DeployConfig, workflow: ?[]const u8, branch: ?[]const u8) bool {
+    const rule = deploy orelse return false;
+    return std.mem.eql(u8, rule.workflow, workflow orelse return false) and
+        std.mem.eql(u8, rule.branch, branch orelse return false);
 }
 
 fn summarizeDeploymentStatus(arena: std.mem.Allocator, body: []const u8) !Summary {
@@ -239,7 +260,7 @@ test "verifySignature rejects a malformed header" {
 }
 
 test "matches only the derived path with POST" {
-    var impl = try Github.init(std.testing.allocator, "s3cr3t");
+    var impl = try Github.init(std.testing.allocator, "s3cr3t", null);
     defer std.testing.allocator.free(impl.target_path);
     const c = impl.channel();
 
@@ -256,7 +277,7 @@ test "summarize: workflow_run completed success" {
     const summary = try summarize(arena, "workflow_run",
         \\{"action":"completed","workflow_run":{"display_title":"CI","conclusion":"success","head_branch":"main"},
         \\ "repository":{"full_name":"acme/api"}}
-    );
+    , null);
 
     try std.testing.expectEqualStrings("acme/api", summary.title);
     try std.testing.expectEqualStrings("CI — success\nBranch: main", summary.message);
@@ -272,7 +293,7 @@ test "summarize: workflow_run completed failure" {
     const summary = try summarize(arena, "workflow_run",
         \\{"action":"completed","workflow_run":{"display_title":"CI","conclusion":"failure","head_branch":"main"},
         \\ "repository":{"full_name":"acme/api"}}
-    );
+    , null);
 
     try std.testing.expectEqualStrings("5", summary.priority);
     try std.testing.expectEqualStrings("x", summary.tags);
@@ -285,7 +306,7 @@ test "summarize: workflow_run in_progress is ignored" {
 
     try std.testing.expectError(error.Ignored, summarize(arena, "workflow_run",
         \\{"action":"in_progress","workflow_run":{"conclusion":null},"repository":{"full_name":"acme/api"}}
-    ));
+    , null));
 }
 
 test "summarize: deployment_status success" {
@@ -296,7 +317,7 @@ test "summarize: deployment_status success" {
     const summary = try summarize(arena, "deployment_status",
         \\{"deployment_status":{"state":"success","description":"all good"},
         \\ "deployment":{"environment":"production"},"repository":{"full_name":"acme/api"}}
-    );
+    , null);
 
     try std.testing.expectEqualStrings("acme/api", summary.title);
     try std.testing.expectEqualStrings("Deployment to production: success\nall good", summary.message);
@@ -310,7 +331,7 @@ test "summarize: deployment_status pending is ignored" {
 
     try std.testing.expectError(error.Ignored, summarize(arena, "deployment_status",
         \\{"deployment_status":{"state":"pending"},"deployment":{"environment":"production"}}
-    ));
+    , null));
 }
 
 test "summarize: ping is a friendly confirmation" {
@@ -318,7 +339,7 @@ test "summarize: ping is a friendly confirmation" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const summary = try summarize(arena, "ping", "{}");
+    const summary = try summarize(arena, "ping", "{}", null);
 
     try std.testing.expectEqualStrings("GitHub", summary.title);
     try std.testing.expectEqualStrings("Webhook connected", summary.message);
@@ -329,7 +350,7 @@ test "summarize: unrecognized event is ignored" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    try std.testing.expectError(error.Ignored, summarize(arena, "star", "{}"));
+    try std.testing.expectError(error.Ignored, summarize(arena, "star", "{}", null));
 }
 
 test "full request: valid signature and event dispatch through the vtable" {
@@ -337,7 +358,7 @@ test "full request: valid signature and event dispatch through the vtable" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var impl = try Github.init(std.testing.allocator, "s3cr3t");
+    var impl = try Github.init(std.testing.allocator, "s3cr3t", null);
     defer std.testing.allocator.free(impl.target_path);
     const c = impl.channel();
 
@@ -358,7 +379,7 @@ test "full request: invalid signature is rejected" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var impl = try Github.init(std.testing.allocator, "s3cr3t");
+    var impl = try Github.init(std.testing.allocator, "s3cr3t", null);
     defer std.testing.allocator.free(impl.target_path);
     const c = impl.channel();
 
@@ -367,4 +388,58 @@ test "full request: invalid signature is rejected" {
     const headers = try testHeaders(&header_buf, "sha256=" ++ "0" ** 64, "ping");
 
     try std.testing.expectError(error.InvalidSignature, c.summarize(arena, body, headers));
+}
+
+const test_deploy: config.DeployConfig = .{
+    .workflow = "Docker build",
+    .url = "https://coolify.example.com/api/v1/deploy?uuid=abc",
+    .token = "ck",
+};
+
+fn testWorkflowRun(buf: []u8, name: []const u8, branch: []const u8, conclusion: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "{{\"action\":\"completed\",\"workflow_run\":{{\"name\":\"{s}\",\"display_title\":\"x\"," ++
+            "\"conclusion\":\"{s}\",\"head_branch\":\"{s}\"}},\"repository\":{{\"full_name\":\"acme/api\"}}}}",
+        .{ name, conclusion, branch },
+    );
+}
+
+test "deploy: matching workflow, branch and success sets summary.deploy" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var buf: [512]u8 = undefined;
+
+    const body = try testWorkflowRun(&buf, "Docker build", "main", "success");
+    const summary = try summarize(arena_state.allocator(), "workflow_run", body, test_deploy);
+
+    try std.testing.expect(summary.deploy);
+}
+
+test "deploy: no deploy block never triggers" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var buf: [512]u8 = undefined;
+
+    const body = try testWorkflowRun(&buf, "Docker build", "main", "success");
+    const summary = try summarize(arena_state.allocator(), "workflow_run", body, null);
+
+    try std.testing.expect(!summary.deploy);
+}
+
+test "deploy: other workflow, other branch or failure do not trigger" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var buf: [512]u8 = undefined;
+
+    const cases = [_]struct { name: []const u8, branch: []const u8, conclusion: []const u8 }{
+        .{ .name = "CI", .branch = "main", .conclusion = "success" },
+        .{ .name = "Docker build", .branch = "feature", .conclusion = "success" },
+        .{ .name = "Docker build", .branch = "main", .conclusion = "failure" },
+    };
+    for (cases) |c| {
+        const body = try testWorkflowRun(&buf, c.name, c.branch, c.conclusion);
+        const summary = try summarize(arena_state.allocator(), "workflow_run", body, test_deploy);
+        try std.testing.expect(!summary.deploy);
+    }
 }
