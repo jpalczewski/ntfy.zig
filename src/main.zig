@@ -520,7 +520,9 @@ fn sleepFor(io: Io, duration: Io.Duration) void {
 
 fn reportFetchResult(label: []const u8, result: http.Client.FetchError!http.Client.FetchResult) !void {
     const fetch_result = try result;
-    if (fetch_result.status != .ok) {
+    // Any 2xx counts: ntfy answers 200, but Coolify-style deploy endpoints may
+    // legitimately answer 202 Accepted (queued) or 204.
+    if (fetch_result.status.class() != .success) {
         std.log.err("{s} responded with status {d}", .{ label, @intFromEnum(fetch_result.status) });
         return error.Rejected;
     }
@@ -559,8 +561,10 @@ test "applyDeployResult flags a failed deploy at top priority" {
     try std.testing.expectEqualStrings("x", updated.tags);
 }
 
-test "reportFetchResult succeeds for a 200 response" {
+test "reportFetchResult succeeds for any 2xx response" {
     try reportFetchResult("test", .{ .status = .ok });
+    try reportFetchResult("test", .{ .status = .accepted });
+    try reportFetchResult("test", .{ .status = .no_content });
 }
 
 // Not tested here: a non-2xx status returning error.Rejected. Verified
