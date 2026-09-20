@@ -77,6 +77,7 @@ pub const Route = struct {
 
 pub const Deploy = struct {
     uri: std.Uri,
+    method: std.http.Method,
     /// Pre-formatted `"Bearer <token>"`.
     auth_value: []const u8,
 };
