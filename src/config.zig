@@ -9,6 +9,11 @@ const Environ = std.process.Environ;
 
 pub const ChannelType = enum { coolify, github };
 
+/// Tags are uppercase because std.json matches enum tags by exact name and
+/// the config spells HTTP methods the usual way (`"method": "POST"`).
+// zlinter-disable-next-line field_naming
+pub const DeployMethod = enum { GET, POST };
+
 /// Trigger and action in one block: when a `github` channel sees a
 /// successful `workflow_run` of `workflow` on `branch`, the relay calls
 /// Coolify's deploy `url` with `token`.
@@ -19,6 +24,9 @@ pub const DeployConfig = struct {
     branch: []const u8 = "main",
     /// Coolify deploy webhook, e.g. `https://coolify.example.com/api/v1/deploy?uuid=<uuid>`.
     url: []const u8,
+    /// HTTP method for the deploy call. Newer Coolify versions answer a `GET`
+    /// with 405 and require `POST`; `GET` stays the default for older ones.
+    method: DeployMethod = .GET,
     /// Coolify API token with deploy permission, sent as `Authorization: Bearer`.
     token: []const u8,
 };
@@ -133,6 +141,33 @@ test "parseChannels reads a github deploy block, branch defaults to main" {
     try std.testing.expectEqualStrings("main", deploy.branch);
     try std.testing.expectEqualStrings("https://coolify.example.com/api/v1/deploy?uuid=abc", deploy.url);
     try std.testing.expectEqualStrings("ck", deploy.token);
+    try std.testing.expectEqual(DeployMethod.GET, deploy.method);
+}
+
+test "parseChannels reads a deploy method of POST" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const channels = try parseChannels(arena_state.allocator(),
+        \\{"channels":[{"type":"github","secret":"s","ntfy_url":"https://n","ntfy_token":"t",
+        \\  "deploy":{"workflow":"w","url":"https://c/deploy","token":"k","method":"POST"}}]}
+    );
+
+    try std.testing.expectEqual(DeployMethod.POST, channels[0].deploy.?.method);
+}
+
+test "parseChannels rejects an unknown deploy method" {
+    try std.testing.expectError(error.InvalidEnumTag, testParse(
+        \\{"channels":[{"type":"github","secret":"s","ntfy_url":"https://n","ntfy_token":"t",
+        \\  "deploy":{"workflow":"w","url":"https://c/deploy","token":"k","method":"PATCH"}}]}
+    ));
+}
+
+test "parseChannels rejects a lowercase deploy method" {
+    try std.testing.expectError(error.InvalidEnumTag, testParse(
+        \\{"channels":[{"type":"github","secret":"s","ntfy_url":"https://n","ntfy_token":"t",
+        \\  "deploy":{"workflow":"w","url":"https://c/deploy","token":"k","method":"post"}}]}
+    ));
 }
 
 test "parseChannels rejects a deploy block missing its token" {

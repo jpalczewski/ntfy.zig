@@ -78,6 +78,10 @@ pub fn main(init: std.process.Init) !void {
             .kind = cc.type,
             .deploy = if (cc.deploy) |d| .{
                 .uri = try std.Uri.parse(d.url),
+                .method = switch (d.method) {
+                    .GET => .GET,
+                    .POST => .POST,
+                },
                 .auth_value = try std.fmt.allocPrint(config_arena, "Bearer {s}", .{d.token}),
             } else null,
         });
@@ -413,8 +417,12 @@ fn triggerDeploy(io: Io, client: *http.Client, deploy: channel.Deploy) !void {
     try sendWithTimeout(io, client, .{
         .label = "coolify deploy",
         .uri = deploy.uri,
-        .method = .GET,
+        .method = deploy.method,
         .auth_value = deploy.auth_value,
+        // `Client.fetch` asserts that a body-carrying method has a payload
+        // and a bodiless one doesn't, so a POST sends an empty body
+        // (`Content-Length: 0`) rather than none.
+        .payload = if (deploy.method.requestHasBody()) "" else null,
     });
 }
 

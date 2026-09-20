@@ -54,6 +54,7 @@ e.g. `/config.json`) and set `CONFIG_FILE=/config.json`.
         "workflow": "Docker build",
         "branch": "main",
         "url": "https://coolify.example.com/api/v1/deploy?uuid=<app uuid>&force=false",
+        "method": "POST",
         "token": "<Coolify API token>"
       }
     }
@@ -100,8 +101,11 @@ push to main → GitHub Actions builds & pushes to GHCR
 
 The `deploy` block is both the trigger and the action: it fires on a
 **successful** `workflow_run` whose workflow name is exactly `workflow` and
-whose branch is `branch` (default `main`), then does a `GET` on `url` with
-`token`. If Coolify rejects it or doesn't answer within 10s, the ntfy
+whose branch is `branch` (default `main`), then calls `url` with `token`
+using `method` — `GET` (the default) or `POST`, uppercase, anything else is
+rejected at startup. Newer Coolify versions answer a `GET` with `405 This
+endpoint has changed to a POST request`, so set `"method": "POST"` for them;
+a `POST` is sent with an empty body. If Coolify rejects it or doesn't answer within 10s, the ntfy
 notification says `Coolify deploy FAILED` and goes out at top priority.
 `url` is Coolify's deploy webhook (`/api/v1/deploy?uuid=<uuid>`); `token` is
 an API token with deploy permission (Keys & Tokens → API Tokens; the API
