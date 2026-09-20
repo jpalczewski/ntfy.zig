@@ -89,15 +89,27 @@ pub fn main(init: std.process.Init) !void {
 
     var app_metrics: metrics.Metrics = .{};
 
-    // Shared across all forward-to-ntfy calls so concurrent webhook handlers
-    // reuse pooled TCP/TLS connections instead of opening a fresh one per
-    // request (see fetchNtfy) — Client.fetch is documented threadsafe, and
-    // its connection_pool/ca_bundle are lock-guarded, so sharing one
-    // instance across concurrent tasks is safe. Like config_arena_state
-    // above, this is deliberately never deinitialized: deinit() asserts no
-    // in-flight requests, and both the accept loop and the internal-server
-    // task run forever.
-    var ntfy_client: http.Client = .{ .allocator = gpa, .io = io };
+    // Shared across all outbound calls (ntfy publish, Coolify deploy) so the
+    // system CA bundle is loaded once rather than per request — Client.fetch
+    // is documented threadsafe, and its connection_pool/ca_bundle are
+    // lock-guarded, so sharing one instance across concurrent tasks is safe.
+    // Like config_arena_state above, this is deliberately never
+    // deinitialized: deinit() asserts no in-flight requests, and both the
+    // accept loop and the internal-server task run forever.
+    //
+    // Idle connection pooling is off (`free_size = 0`): every request opens a
+    // fresh connection and it is closed afterwards. Webhooks arrive minutes
+    // apart, far longer than the idle timeout of the proxies in front of
+    // ntfy/Coolify, so a pooled connection is almost always already closed by
+    // the peer. The client then writes into the dead socket, reads EOF and
+    // fails with `HttpConnectionClosing` — losing the notification or deploy.
+    // Retrying isn't safe for the deploy POST, and a fresh connection is
+    // cheap at this request rate.
+    var ntfy_client: http.Client = .{
+        .allocator = gpa,
+        .io = io,
+        .connection_pool = .{ .free_size = 0 },
+    };
 
     var address = try net.IpAddress.parseIp4("0.0.0.0", listen_port);
     var server = try address.listen(io, .{ .reuse_address = true });
